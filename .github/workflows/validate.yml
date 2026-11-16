@@ -1,0 +1,32 @@
+name: Validate
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  php:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.4', '8.5']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: YOURLS/YOURLS
+          ref: 8220c8dd191e5f212bf5d77048e62975b2e2de4d
+          path: upstream-yourls
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, mysqli, intl
+          coverage: none
+      - name: PHP syntax
+        run: find . -path ./upstream-yourls -prune -o -name '*.php' -type f -exec php -l {} \;
+      - name: Offline behavioral regression
+        run: php tests/run.php
+      - name: cURL security configuration contract
+        run: php tests/curl-safety-contract.php
+      - name: YOURLS 1.10.6 hook contract
+        run: YOURLS_SOURCE="$PWD/upstream-yourls" php tests/yourls-hook-contract.php
