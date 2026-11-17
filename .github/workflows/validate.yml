@@ -57,7 +57,7 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: curl, mysqli, pdo_mysql, intl
+          extensions: curl, mysqli, pdo_mysql, pdo_sqlite, intl
           coverage: none
       - name: PHP syntax
         run: find . -path ./upstream-yourls -prune -o -name '*.php' -type f -exec php -l {} \;
@@ -69,6 +69,8 @@ jobs:
         run: YOURLS_SOURCE="$PWD/upstream-yourls" php tests/yourls-hook-contract.php
       - name: Historical review and deletion-safety regressions
         run: php tests/history-review.php
+      - name: Bulk selection and streamed deletion regressions
+        run: php tests/bulk-history.php
       - name: Deterministic overlapping WorkGate ownership
         run: php tests/workgate-concurrency.php
       - name: Isolated YOURLS 1.10.6 and MariaDB integration

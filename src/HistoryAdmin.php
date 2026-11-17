@@ -79,6 +79,7 @@ function ach_url_guard_history_confirmation(
 /** Registered by YOURLS under /admin/plugins.php?page=ach_url_guard_history. */
 function ach_url_guard_history_page(): void
 {
+    ach_url_guard_require_admin();
     $settings = Policy::settings(yourls_get_option('ach_url_guard_settings', []));
     $db = yourls_get_db('read-ach_guard_history');
     $size = HistoricalReview::pageSize($_GET['limit'] ?? 50);
@@ -87,8 +88,9 @@ function ach_url_guard_history_page(): void
     $feedback = null;
     $confirm = null;
     $page = null;
+    [$bulkJob, $bulkError] = ach_url_guard_bulk_request($db);
 
-    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST' && isset($_POST['history_action'])) {
         $post = static function (string $key): string {
             return isset($_POST[$key]) && is_string($_POST[$key]) ? $_POST[$key] : '';
         };
@@ -148,7 +150,7 @@ function ach_url_guard_history_page(): void
         . '">Guard settings</a></p>';
     echo '<p>Existing redirects are unchanged by this page. Local policy preview is read-only.'
         . ' A matched rule is <strong>not proof of malicious intent</strong>.'
-        . ' Review individual links before removal. No automatic or bulk deletion.</p>';
+        . ' Review individuals or explicitly confirm a filter-based batch; no autonomous deletion.</p>';
     echo '<p>HTTP checks are <strong>opt-in per link</strong>, can be slow and make outbound'
         . ' requests. DNSBL and Web Risk are never invoked by this review UI.'
         . ' To audit large sets with network requests, use the documented private CLI audit.</p>';
@@ -158,6 +160,10 @@ function ach_url_guard_history_page(): void
     if ($confirm !== null) {
         ach_url_guard_history_confirmation($confirm[0], $confirm[1], $confirm[2], $settings);
     }
+
+    if ($bulkError !== '') ach_url_guard_history_message($bulkError);
+    if ($bulkJob !== null) ach_url_guard_bulk_job($bulkJob);
+    ach_url_guard_bulk_filter_form();
 
     echo '<form method="get"><input type="hidden" name="page" value="ach_url_guard_history" />';
     echo '<p><label>Find exact short keyword: <input type="text" name="keyword" value="'
@@ -191,12 +197,12 @@ function ach_url_guard_history_page(): void
             . ' All rows are displayed so links without a local-policy match can be HTTP-checked individually.'
             . '</p>';
         echo '<div style="overflow-x:auto"><table class="tbl" style="width:100%;">';
-        echo '<thead><tr><th>Short keyword</th><th>Destination host</th>'
+        echo '<thead><tr><th><label><input type="checkbox" id="ach-history-select-all" />' . ' Select all visible</label></th><th>Short keyword</th><th>Destination host</th>'
             . '<th>Local policy result</th><th>Clicks</th><th>Action</th></tr></thead><tbody>';
         foreach ($page['rows'] as $row) {
             $verdict = HistoricalReview::inspect($row, $settings);
             $flagged = $verdict['status'] === 'deny';
-            echo '<tr><td><code>' . ach_url_guard_esc((string) $row['keyword']) . '</code></td>';
+            echo '<tr><td><input type="checkbox" class="ach-history-select"' . ' name="bulk_keywords[]" form="ach-bulk-create" value="' . ach_url_guard_esc((string) $row['keyword']) . '" aria-label="Select ' . ach_url_guard_esc((string) $row['keyword']) . '" />' . '</td><td><code>' . ach_url_guard_esc((string) $row['keyword']) . '</code></td>';
             echo '<td>' . ach_url_guard_esc(HistoricalReview::hostLabel((string) $row['url'])) . '</td>';
             echo '<td>' . ach_url_guard_esc(ach_url_guard_history_reason_label((string) $verdict['reason']));
             if ($flagged) {
@@ -215,6 +221,9 @@ function ach_url_guard_history_page(): void
                 . ($flagged ? 'Review deletion' : 'Check HTTP') . '</button></form></td></tr>';
         }
         echo '</tbody></table></div>';
+        echo '<script>(function(){var a=document.getElementById("ach-history-select-all");'
+            . 'if(a)a.addEventListener("change",function(){document.querySelectorAll(".ach-history-select")'
+            . '.forEach(function(e){e.checked=a.checked;});});})();</script>';
         if ($page['has_more'] && $lookup === '') {
             echo '<p><a href="' . ach_url_guard_esc(
                 yourls_admin_url('plugins.php?page=ach_url_guard_history')

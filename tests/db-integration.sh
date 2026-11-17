@@ -110,7 +110,7 @@ define('YOURLS_DB_HOST', getenv('ACH_IT_DB_HOST') . (getenv('ACH_IT_DB_HOST') ==
 define('YOURLS_DB_PREFIX', 'yourls_');
 define('YOURLS_SITE', 'http://127.0.0.1:' . getenv('ACH_IT_HTTP_PORT'));
 define('YOURLS_COOKIEKEY', getenv('ACH_IT_COOKIE_KEY'));
-define('YOURLS_PRIVATE', true);
+define('YOURLS_PRIVATE', getenv('ACH_IT_PRIVATE') !== '0');
 define('YOURLS_URL_CONVERT', 36);
 // This isolated suite creates many links per second. Production retains native flood protection.
 // Fixture normally disables flood for rapid link insertions; final native-flood probes opt back in.
@@ -161,6 +161,34 @@ done
 if [[ "$ready" != 1 ]]; then tail -50 "$tmp/http.log" >&2; exit 1; fi
 if ! run_php "$repo/tests/http-integration.php" verify; then
   tail -65 "$tmp/http.log" >&2
+  exit 1
+fi
+
+# Restart only the disposable local HTTP server with YOURLS in public mode.
+# In public mode the native YOURLS admin router itself does not require login;
+# the plugin must protect its sensitive pages independently.
+kill "$http_pid" >/dev/null 2>&1 || true
+wait "$http_pid" >/dev/null 2>&1 || true
+http_pid=''
+if [[ -n "$ACH_IT_DB_SOCKET" ]]; then
+  ACH_IT_PRIVATE=0 php -d "pdo_mysql.default_socket=$ACH_IT_DB_SOCKET" \
+    -d "mysqli.default_socket=$ACH_IT_DB_SOCKET" \
+    -S "127.0.0.1:$ACH_IT_HTTP_PORT" -t "$ACH_IT_SITE" "$tmp/router.php" \
+    >"$tmp/public-http.log" 2>&1 &
+else
+  ACH_IT_PRIVATE=0 php -S "127.0.0.1:$ACH_IT_HTTP_PORT" -t "$ACH_IT_SITE" \
+    "$tmp/router.php" >"$tmp/public-http.log" 2>&1 &
+fi
+http_pid=$!
+ready=0
+for _ in {1..40}; do
+  if run_php "$repo/tests/http-integration.php" ping >/dev/null 2>&1; then ready=1; break; fi
+  if ! kill -0 "$http_pid" 2>/dev/null; then break; fi
+  sleep 0.25
+done
+if [[ "$ready" != 1 ]]; then tail -50 "$tmp/public-http.log" >&2; exit 1; fi
+if ! run_php "$repo/tests/http-integration.php" verify-public; then
+  tail -65 "$tmp/public-http.log" >&2
   exit 1
 fi
 

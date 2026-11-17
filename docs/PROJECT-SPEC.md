@@ -48,14 +48,24 @@ redirects and customer data.
   outcome and reason without exposing sensitive URL query data. Permit explicit
   per-link HTTP verification only on operator request; never scan external
   destinations, DNSBL or Web Risk simply by opening the admin page.
-- Allow a new **manual-only** exception for permanent deletion of an identified
-  older link after human review and a second confirmation. Re-check the exact
-  row, policy, definite verdict and anti-CSRF nonce before invoking native
-  YOURLS deletion, with a database transaction to prevent a concurrent update
-  from redirecting deletion to a different row. Never classify overlong
-  historical/generated aliases as an automatic deletion reason. Existing
-  links remain untouched without this explicit action: no automatic or mass
-  deletion, rewriting, redirect-time blocking, background scans or migrations.
+- Provide individual manual review and operator-approved **filtered bulk
+  deletion**. Selection supports visible-page checkboxes/Select All and all
+  matching a set of filters across every page, without individual inspection.
+  A complete dry-run materializes exact candidate row proofs in an indexed
+  plugin table, plus small owner-bound progress records in YOURLS options.
+  Require a typed count and checkbox to confirm permanent deletion; support
+  restartable keyset batches, stop, progress and saved resume link.
+- Recheck each candidate's exact stored row, effective policy, reason, filter
+  and CSRF authorization before native YOURLS deletion. Skip changed, healthy
+  or unknown candidates and never substitute later links for snapshotted
+  candidates. Historical/generated alias length alone is not a delete reason.
+  Optional HTTP 404/410 bulk scanning must be explicitly opted into, bounded
+  to one check per request and rechecked before deletion. No DNSBL/Google
+  scans merely by opening the admin page.
+- No unattended auto-delete, scheduled worker/cron, redirect-time block or
+  unrelated site mutation. Permanent deletion requires an authenticated admin
+  and specific approval. One plugin-owned candidate table is created on first
+  bulk review without altering YOURLS core tables.
 - Record privacy-preserving, diagnostic, bounded observations without leaking
   URL query tokens, credentials or costly excessive log/database writes.
 
@@ -70,8 +80,9 @@ redirects and customer data.
 - No guarantee against future Cloudflare or Google reputation flags.
   Operators remain responsible for handling reports of abuse.
 - Preserve the lrl.li homepage, branding, other plugins, credentials,
-  database schema and every existing short URL except those individually
-  and explicitly removed by an authorized admin through the manual review flow.
+  YOURLS core tables and existing links except those individually or as a
+  frozen candidate set explicitly deleted by an authenticated admin. A
+  plugin-owned candidate snapshot table is permitted for scalable review.
 
 ## Delivery and approval boundaries
 

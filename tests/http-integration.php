@@ -15,8 +15,8 @@ if ($phase === 'ping') {
     fclose($socket);
     exit(0);
 }
-if ($phase !== 'verify') {
-    throw new RuntimeException('Expected ping or verify.');
+if (!in_array($phase, ['verify','verify-public'], true)) {
+    throw new RuntimeException('Expected ping, verify, or verify-public.');
 }
 $base = 'http://127.0.0.1:' . $port;
 $expect = static function (bool $truth, string $message): void {
@@ -45,6 +45,25 @@ $request = static function (string $path, ?array $post = null) use ($base): arra
     }
     return [(int) $match[1], $headers, $body];
 };
+if ($phase === 'verify-public') {
+    foreach (['/admin/plugins.php?page=ach_url_guard',
+              '/admin/plugins.php?page=ach_url_guard_history'] as $url) {
+        [$status,,$html] = $request($url);
+        $expect($status === 403, 'Public-mode anonymous admin GET must return 403: ' . $url);
+        $expect(!str_contains($html, 'Historical Link Review')
+            && !str_contains($html, 'name="ach_url_guard_save"'),
+            'Public mode cannot disclose plugin admin controls.');
+        [$status,,$html] = $request($url, [
+            'history_action'=>'delete','history_keyword'=>'yourlsblog',
+            'history_confirm'=>'1','nonce'=>'anonymous'
+        ]);
+        $expect($status === 403, 'Public-mode anonymous admin POST must return 403: ' . $url);
+    }
+    [$status,,$body] = $request('/');
+    $expect($status === 200, 'Public homepage still available when admin is protected.');
+    echo 'PASS public-mode unauthenticated settings/review GET and POST denied; homepage works.' . "\n";
+    exit(0);
+}
 $credentials = [
     'username' => 'integration',
     'password' => (string) getenv('ACH_IT_ADMIN_PASS'),

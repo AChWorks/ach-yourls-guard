@@ -16,7 +16,7 @@ final class HistoricalReview
         return in_array($parsed, [25, 50, 100], true) ? (int) $parsed : 50;
     }
 
-    private static function table(): string
+    public static function urlTable(): string
     {
         $name = (string) YOURLS_DB_TABLE_URL;
         if (!preg_match('/^[a-zA-Z0-9_]+$/D', $name)) {
@@ -34,7 +34,7 @@ final class HistoricalReview
         $size = self::pageSize($size);
         $limit = $size + 1;
         $rows = $db->fetchAll(
-            'SELECT keyword, url, title, timestamp, clicks FROM ' . self::table()
+            'SELECT keyword, url, title, timestamp, clicks FROM ' . self::urlTable()
             . ' WHERE keyword > :cursor ORDER BY keyword ASC LIMIT ' . $limit,
             ['cursor' => $cursor]
         );
@@ -50,7 +50,7 @@ final class HistoricalReview
             return null;
         }
         $row = $db->fetchObject(
-            'SELECT keyword, url, title, timestamp, clicks FROM ' . self::table()
+            'SELECT keyword, url, title, timestamp, clicks FROM ' . self::urlTable()
             . ' WHERE keyword = :keyword' . ($lock ? ' FOR UPDATE' : ''),
             ['keyword' => $keyword]
         );
@@ -67,7 +67,7 @@ final class HistoricalReview
      * generated aliases. Deliberately ignore that cap for old-link review.
      * Network checks are opt-in and never contact reputation vendors.
      */
-    public static function inspect(array $row, array $settings, bool $network = false): array
+    public static function inspect(array $row, array $settings, bool $network = false, ?callable $networkCheck = null): array
     {
         $settings = Policy::settings($settings);
         $local = Policy::inspect((string) $row['url'], $settings);
@@ -90,7 +90,10 @@ final class HistoricalReview
         $settings['reachability_enabled'] = true;
         $settings['web_risk_enabled'] = false;
         $settings['dnsbl_enabled'] = false;
-        return self::conservative((new Guard())->evaluate((string) $row['url'], $settings, ''));
+        $result = $networkCheck === null
+            ? (new Guard())->evaluate((string) $row['url'], $settings, '')
+            : $networkCheck((string) $row['url'], $settings);
+        return self::conservative($result);
     }
 
     /**
@@ -99,15 +102,20 @@ final class HistoricalReview
      * definite policy violations as candidates for irreversible deletion.
      * New verdict reasons require deliberate review before enabling deletion.
      */
-    private static function isDefiniteReason(string $reason): bool
+    public static function isDefiniteReason(string $reason): bool
     {
-        return in_array($reason, [
+        return in_array($reason, self::definiteReasons(), true);
+    }
+
+    public static function definiteReasons(): array
+    {
+        return [
             'invalid_url', 'unsupported_scheme', 'url_credentials_disallowed',
             'private_address', 'ambiguous_ip', 'invalid_hostname',
             'blocked_domain', 'blocked_url_term', 'blocked_url_pattern',
             'blocked_short_keyword', 'root_url',
             'http_not_found', 'private_dns_address', 'invalid_redirect',
-        ], true);
+        ];
     }
 
     private static function conservative(array $verdict): array
@@ -137,14 +145,14 @@ final class HistoricalReview
     }
 
     /** Lock the authoritative stored policy too; a cached YOURLS option may be stale. */
-    private static function lockedSettings($db): array
+    public static function storedSettings($db, bool $lock = false): array
     {
         $table = (string) YOURLS_DB_TABLE_OPTIONS;
         if (!preg_match('/^[a-zA-Z0-9_]+$/D', $table)) {
             throw new \RuntimeException('Invalid YOURLS options table identifier');
         }
         $rows = $db->fetchAll(
-            'SELECT option_value FROM ' . $table . ' WHERE option_name = :name FOR UPDATE',
+            'SELECT option_value FROM ' . $table . ' WHERE option_name = :name' . ($lock ? ' FOR UPDATE' : ''),
             ['name' => 'ach_url_guard_settings']
         );
         if ($rows === []) {
@@ -179,7 +187,8 @@ final class HistoricalReview
         string $expectedProof,
         string $expectedReason,
         bool $network,
-        array $settings
+        array $settings,
+        ?callable $networkCheck = null
     ): string {
         if (!preg_match('/^[a-f0-9]{64}$/D', $expectedProof)
             || $expectedReason === ''
@@ -193,7 +202,7 @@ final class HistoricalReview
             if ($row === null || !hash_equals(self::proof($row, $settings), $expectedProof)) {
                 return 'stale';
             }
-            $result = self::inspect($row, $settings, $network);
+            $result = self::inspect($row, $settings, $network, $networkCheck);
             if ($result['status'] !== 'deny' || $result['reason'] !== $expectedReason) {
                 return 'no_longer_flagged';
             }
@@ -204,7 +213,7 @@ final class HistoricalReview
                 // A second administrator may have changed rules while this
                 // request was doing network I/O. Re-read/lock the stored
                 // option instead of trusting this request's cached option.
-                $currentPolicy = self::lockedSettings($db);
+                $currentPolicy = self::storedSettings($db, true);
                 if ($locked === null || !hash_equals(self::proof($locked, $currentPolicy), $expectedProof)) {
                     $db->rollBack();
                     return 'stale';
