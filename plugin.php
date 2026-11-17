@@ -199,7 +199,7 @@ function ach_url_guard_admin_page(): void
     if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['ach_url_guard_save'])) {
         yourls_verify_nonce('ach_url_guard_settings', isset($_POST['nonce']) && is_string($_POST['nonce']) ? $_POST['nonce'] : '');
         $raw = [];
-        foreach (['mode', 'unknown_action', 'connect_timeout_seconds', 'request_timeout_seconds', 'max_redirects', 'recent_event_count', 'min_custom_keyword_length', 'max_custom_keyword_length'] as $name) {
+        foreach (['mode', 'unknown_action', 'connect_timeout_seconds', 'request_timeout_seconds', 'max_redirects', 'recent_event_count'] as $name) {
             if (isset($_POST[$name]) && is_scalar($_POST[$name])) {
                 $raw[$name] = $_POST[$name];
             }
@@ -234,16 +234,26 @@ function ach_url_guard_admin_page(): void
                 $errors[] = 'blocked_short_keywords: ' . $shortKeyword;
             }
         }
+        // Both numeric controls are always posted by this form. Missing or
+        // non-scalar fields must be rejected, not silently defaulted: that
+        // would overwrite a previously configured policy on an invalid POST.
         foreach (['min_custom_keyword_length', 'max_custom_keyword_length'] as $field) {
-            if (isset($raw[$field]) &&
-                (filter_var($raw[$field], FILTER_VALIDATE_INT) === false ||
-                    (int) $raw[$field] < 0)) {
-                $errors[] = $field . ': must be a nonnegative integer';
+            if (!array_key_exists($field, $_POST)) {
+                $errors[] = $field . ': required';
+                continue;
             }
+            $value = $_POST[$field];
+            if ((!is_string($value) && !is_int($value)) ||
+                filter_var($value, FILTER_VALIDATE_INT) === false ||
+                (int) $value < 0) {
+                $errors[] = $field . ': must be a nonnegative integer';
+                continue;
+            }
+            $raw[$field] = $value;
         }
         if ($errors === []) {
-            $minimum = (int) ($raw['min_custom_keyword_length'] ?? 0);
-            $maximum = (int) ($raw['max_custom_keyword_length'] ?? 20);
+            $minimum = (int) $raw['min_custom_keyword_length'];
+            $maximum = (int) $raw['max_custom_keyword_length'];
             if ($maximum > 0 && $minimum > $maximum) {
                 $errors[] = 'min_custom_keyword_length: cannot exceed the enabled maximum';
             }

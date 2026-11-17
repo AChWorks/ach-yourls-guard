@@ -268,6 +268,47 @@ $expect(($saved['max_custom_keyword_length'] ?? null) === 20, 'Custom keyword ca
 $expect(($saved['blocked_url_terms'] ?? null) === ['casino'], 'Literal URL terms persist.');
 $expect(($saved['blocked_url_patterns'] ?? null) === ['~/(?:offer|sale)(?:/|$)~i'], 'PCRE patterns persist.');
 $expect(($saved['blocked_short_keywords'] ?? null) === ['reserved'], 'Custom reserved aliases persist.');
+
+// Verify malformed authenticated POST inputs are rejected by the real YOURLS
+// settings callback and never write even one byte of the stored policy option.
+$validSettingsPost = $_POST;
+$storedSettingsBefore = $pdo->query(
+    "SELECT option_value FROM yourls_options WHERE option_name='ach_url_guard_settings'"
+)->fetchColumn();
+$expect(is_string($storedSettingsBefore), 'Guard settings are persisted in real MariaDB options.');
+$malformedSettingsCases = [
+    'minimum array' => ['min_custom_keyword_length', ['5'], false],
+    'maximum array' => ['max_custom_keyword_length', ['20'], false],
+    'missing minimum' => ['min_custom_keyword_length', null, true],
+    'missing maximum' => ['max_custom_keyword_length', null, true],
+    'empty minimum' => ['min_custom_keyword_length', '', false],
+    'noninteger maximum' => ['max_custom_keyword_length', 'oops', false],
+    'negative minimum' => ['min_custom_keyword_length', '-1', false],
+    'oversized maximum' => ['max_custom_keyword_length', '99999999999999999999999999999', false],
+    'minimum above maximum' => ['min_custom_keyword_length', '21', false],
+];
+foreach ($malformedSettingsCases as $name => [$field, $value, $missing]) {
+    $_POST = $validSettingsPost;
+    $_POST['mode'] = 'monitor'; // Would otherwise change the saved policy.
+    if ($missing) {
+        unset($_POST[$field]);
+    } else {
+        $_POST[$field] = $value;
+    }
+    ob_start();
+    ach_url_guard_admin_page();
+    $invalidBoundsHtml = ob_get_clean();
+    $expect(str_contains($invalidBoundsHtml, 'Invalid settings, nothing saved:'),
+        $name . ': invalid settings must report an explicit error');
+    $expect(str_contains($invalidBoundsHtml, $field . ':'),
+        $name . ': error must identify the malformed bound');
+    $expect(yourls_get_option('ach_url_guard_settings', []) === $saved,
+        $name . ': entire settings object must remain strictly unchanged');
+    $expect($pdo->query(
+        "SELECT option_value FROM yourls_options WHERE option_name='ach_url_guard_settings'"
+    )->fetchColumn() === $storedSettingsBefore,
+        $name . ': persisted database option must remain byte-for-byte unchanged');
+}
 $_POST = [];
 $_GET = [];
 $_SERVER['REQUEST_METHOD'] = 'GET';

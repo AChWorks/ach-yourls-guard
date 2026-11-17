@@ -444,6 +444,47 @@ eq(5, $fakeOptions['ach_url_guard_settings']['min_custom_keyword_length'],
 eq(0, $fakeOptions['ach_url_guard_settings']['max_custom_keyword_length'],
     'administrator can disable maximum independently of minimum');
 
+// A malformed authenticated form must not silently reset an existing policy
+// or partially apply other valid fields from that same POST.
+$originalForm = $_POST;
+$originalStoredSettings = $fakeOptions['ach_url_guard_settings'];
+$invalidLengthCases = [
+    'minimum array' => ['min_custom_keyword_length', ['5'], false, 'must be a nonnegative integer'],
+    'maximum array' => ['max_custom_keyword_length', ['20'], false, 'must be a nonnegative integer'],
+    'nested minimum array' => ['min_custom_keyword_length', [['5']], false, 'must be a nonnegative integer'],
+    'missing minimum' => ['min_custom_keyword_length', null, true, 'required'],
+    'missing maximum' => ['max_custom_keyword_length', null, true, 'required'],
+    'null minimum' => ['min_custom_keyword_length', null, false, 'must be a nonnegative integer'],
+    'null maximum' => ['max_custom_keyword_length', null, false, 'must be a nonnegative integer'],
+    'empty minimum' => ['min_custom_keyword_length', '', false, 'must be a nonnegative integer'],
+    'empty maximum' => ['max_custom_keyword_length', '', false, 'must be a nonnegative integer'],
+    'nonnumeric minimum' => ['min_custom_keyword_length', 'abc', false, 'must be a nonnegative integer'],
+    'fraction maximum' => ['max_custom_keyword_length', '5.5', false, 'must be a nonnegative integer'],
+    'negative minimum' => ['min_custom_keyword_length', '-1', false, 'must be a nonnegative integer'],
+    'negative maximum' => ['max_custom_keyword_length', '-1', false, 'must be a nonnegative integer'],
+    'oversized minimum' => ['min_custom_keyword_length', '99999999999999999999999999999', false, 'must be a nonnegative integer'],
+    'oversized maximum' => ['max_custom_keyword_length', '99999999999999999999999999999', false, 'must be a nonnegative integer'],
+    'boolean minimum' => ['min_custom_keyword_length', true, false, 'must be a nonnegative integer'],
+    'minimum above maximum' => ['min_custom_keyword_length', '6', false, 'cannot exceed the enabled maximum'],
+];
+foreach ($invalidLengthCases as $case => [$field, $value, $missing, $message]) {
+    $_POST = $originalForm;
+    $_POST['mode'] = 'enforce'; // An otherwise valid setting must not partially apply.
+    $_POST['max_custom_keyword_length'] = '5';
+    if ($missing) {
+        unset($_POST[$field]);
+    } else {
+        $_POST[$field] = $value;
+    }
+    ob_start(); ach_url_guard_admin_page(); $invalidLengthHtml = ob_get_clean();
+    eq(true, str_contains($invalidLengthHtml, 'Invalid settings, nothing saved:'),
+        $case . ': explicit invalid-form feedback');
+    eq(true, str_contains($invalidLengthHtml, $field . ': ' . $message),
+        $case . ': field-specific error');
+    eq($originalStoredSettings, $fakeOptions['ach_url_guard_settings'],
+        $case . ': no partial setting write');
+}
+$_POST = $originalForm;
 
 // WorkGate shares a small anonymous file state across requests for optional
 // expensive checks. No customer URL or source IP may appear in those files.
