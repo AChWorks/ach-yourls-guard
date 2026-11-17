@@ -254,6 +254,88 @@ $expect(($saved['blocked_url_terms'] ?? null) === ['casino'], 'Literal URL terms
 $expect(($saved['blocked_url_patterns'] ?? null) === ['~/(?:offer|sale)(?:/|$)~i'], 'PCRE patterns persist.');
 $expect(($saved['blocked_short_keywords'] ?? null) === ['reserved'], 'Custom reserved aliases persist.');
 $_POST = [];
+$_GET = [];
+$_SERVER['REQUEST_METHOD'] = 'GET';
+
+// Real YOURLS/MySQL historical review: read-only browsing followed by an
+// intentional deletion of only a disposable, test-owned link. The native
+// deletion/cache/hooks path runs inside the plugin's locked transaction.
+$historyDB = yourls_get_db('read-history_integration');
+$historyPolicy = \ACh\Yourls\UrlGuard\Policy::settings(
+    yourls_get_option('ach_url_guard_settings', [])
+);
+$baselineHistory = $pdo->query('SELECT keyword,url,title FROM yourls_url ORDER BY keyword')->fetchAll(PDO::FETCH_ASSOC);
+$historyPage = \ACh\Yourls\UrlGuard\HistoricalReview::page($historyDB, '', 25);
+$expect(count($historyPage['rows']) > 0, 'Historical browser must return real YOURLS URL rows.');
+ob_start();
+ach_url_guard_history_page();
+$historyHtml = ob_get_clean();
+$expect(str_contains($historyHtml, 'Historical Link Review'), 'Actual plugin review UI renders.');
+$expect(str_contains($historyHtml, 'Check HTTP'), 'Healthy records offer manual HTTP checks.');
+$expect(!str_contains($historyHtml, 'not-for-logs'), 'Historical UI never leaks private query tokens.');
+$expect($pdo->query('SELECT keyword,url,title FROM yourls_url ORDER BY keyword')->fetchAll(PDO::FETCH_ASSOC)
+    === $baselineHistory, 'Historical UI and page scanning cannot modify existing URLs.');
+
+$historyName = 'history-delete-fixture';
+$expect(yourls_insert_link_in_db('https://bad.example/private?token=DO_NOT_RENDER',
+    $historyName, 'History-only test record'), 'A flagged test-owned record must be inserted.');
+$marked = \ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName);
+$expect($marked !== null, 'Historical lookup retrieves the exact fixture row.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::inspect($marked, $historyPolicy)['reason']
+    === 'blocked_domain', 'Current local Guard policy flags fixture row.');
+$reviewProof = \ACh\Yourls\UrlGuard\HistoricalReview::proof($marked, $historyPolicy);
+$_SERVER['REQUEST_METHOD'] = 'POST';
+$_POST = [
+    'history_action' => 'review', 'history_keyword' => $historyName,
+    'nonce' => yourls_create_nonce('ach_url_guard_history_review'),
+];
+ob_start(); ach_url_guard_history_page(); $confirmationHTML = ob_get_clean();
+$expect(str_contains($confirmationHTML, 'Delete this short link permanently'),
+    'Real YOURLS nonce and admin review render a confirmation form.');
+$expect(!str_contains($confirmationHTML, 'DO_NOT_RENDER'),
+    'Review confirmation hides URL query tokens.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName) !== null,
+    'Review form must not delete a link.');
+
+$originalTitle = 'History-only test record';
+$updateHistory = $pdo->prepare('UPDATE yourls_url SET title = ? WHERE keyword = ?');
+$updateHistory->execute(['Changed after preview', $historyName]);
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::delete($historyDB, $historyName,
+    $reviewProof, 'blocked_domain', false, $historyPolicy) === 'stale',
+    'Native DB row edit invalidates the original approval.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName) !== null,
+    'Stale deletion cannot remove modified link.');
+$updateHistory->execute([$originalTitle, $historyName]);
+$marked = \ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName);
+$reviewProof = \ACh\Yourls\UrlGuard\HistoricalReview::proof($marked, $historyPolicy);
+
+$cleanPolicy = $historyPolicy;
+$cleanPolicy['blocked_domains'] = [];
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::delete($historyDB, $historyName,
+    \ACh\Yourls\UrlGuard\HistoricalReview::proof($marked, $cleanPolicy),
+    'blocked_domain', false, $cleanPolicy) === 'no_longer_flagged',
+    'Policy no longer flagging link prevents deletion.');
+
+$_POST = [
+    'history_action' => 'delete', 'history_keyword' => $historyName,
+    'history_proof' => $reviewProof, 'history_reason' => 'blocked_domain',
+    'history_scope' => 'local', 'history_confirm' => '1',
+    'nonce' => yourls_create_nonce('ach_url_guard_history_delete'),
+];
+ob_start(); ach_url_guard_history_page(); $deletedHTML = ob_get_clean();
+$expect(str_contains($deletedHTML, 'Reviewed short link was deleted'),
+    'Explicit YOURLS admin confirmation deletes only tested fixture.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName) === null,
+    'Native deletion removed the test-owned row.');
+$expect(yourls_get_keyword_infos($historyName, false) === false,
+    'Native YOURLS keyword lookup observes deleted record.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::delete($historyDB, $historyName,
+    $reviewProof, 'blocked_domain', false, $historyPolicy) === 'stale',
+    'A repeated delete cannot alter any other row.');
+$expect($pdo->query("SELECT url FROM yourls_url WHERE keyword='yourlsblog'")->fetchColumn()
+    === $knownBefore, 'Pre-existing YOURLS redirect stays intact after reviewed deletion.');
+$_POST = [];
+$_GET = [];
 $_SERVER['REQUEST_METHOD'] = 'GET';
 
 echo 'PASS real DB integration: active plugins, monitor, enforce, API, admin callback, old links, data privacy.' . "\n";

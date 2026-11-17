@@ -2,8 +2,8 @@
 /*
 Plugin Name: ACh URL Guard
 Plugin URI: https://github.com/AChWorks/ach-yourls-guard
-Description: Configurable safe URL validation, exact domain rules, monitored reachability, and optional threat intelligence. Never deletes existing URLs.
-Version: 0.1.0
+Description: Safe new-link policy enforcement and an optional admin-only manual review of historical short links.
+Version: 0.2.0
 Author: ACh
 */
 
@@ -16,6 +16,8 @@ require_once __DIR__ . '/src/HttpProbe.php';
 require_once __DIR__ . '/src/Reputation.php';
 require_once __DIR__ . '/src/Guard.php';
 require_once __DIR__ . '/src/WorkGate.php';
+require_once __DIR__ . '/src/HistoricalReview.php';
+require_once __DIR__ . '/src/HistoryAdmin.php';
 
 use ACh\Yourls\UrlGuard\Policy;
 use ACh\Yourls\UrlGuard\Guard;
@@ -149,6 +151,7 @@ function ach_url_guard_record_event(string $url, array $result, array $settings)
 function ach_url_guard_register_page(): void
 {
     yourls_register_plugin_page('ach_url_guard', 'ACh URL Guard', 'ach_url_guard_admin_page');
+    yourls_register_plugin_page('ach_url_guard_history', 'ACh URL Guard — Historical Review', 'ach_url_guard_history_page');
 }
 
 function ach_url_guard_esc($value): string
@@ -214,7 +217,8 @@ function ach_url_guard_admin_page(): void
 
     echo '<main role="main" style="max-width:850px;margin:2em auto;">';
     echo '<h2>ACh URL Guard</h2>';
-    echo '<p>New URLs only. No existing link is rewritten, deleted or blocked on redirect.</p>';
+    echo '<p>Automatic rules apply to new links only; existing redirects remain unchanged unless an admin explicitly reviews and deletes an individual historical link.</p>';
+    echo '<p><a href="' . ach_url_guard_esc(yourls_admin_url('plugins.php?page=ach_url_guard_history')) . '">Review existing links (manual deletion only)</a></p>';
     if ($feedback !== '') {
         echo '<p class="' . (strpos($feedback, 'Invalid') === 0 ? 'error' : 'success') . '">' . ach_url_guard_esc($feedback) . '</p>';
     }

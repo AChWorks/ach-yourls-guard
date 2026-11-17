@@ -107,4 +107,9 @@ $expect($newLocation === 'https://example.com/HTTP/CaseSensitive?abc=XYZ', 'Redi
 [$httpCode, , $body] = $request('/admin/plugins.php?page=ach_url_guard');
 $expect(!str_contains($body, 'name="ach_url_guard_save"'), 'Unauthenticated visitor cannot access Guard settings form.');
 
+[$httpCode, , $body] = $request('/admin/plugins.php?page=ach_url_guard_history');
+$expect(!str_contains($body, 'Historical Link Review'), 'Unauthenticated visitor cannot access historical review page.');
+$expect(!str_contains($body, 'history_action'), 'Unauthenticated visitor cannot access review/delete forms.');
+
+
 echo 'PASS loopback HTTP: authenticated API allow/deny, old/new real redirects, protected admin settings.' . "\n";

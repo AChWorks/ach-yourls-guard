@@ -43,8 +43,19 @@ redirects and customer data.
   the active entry, preventing stale results from overwriting newer work.
 - Preserve native YOURLS anti-flood and interoperability with Random ShortURLs,
   Allow Hyphens and Force Lowercase, existing aliases and case-sensitive URL paths.
-- Offer bounded manual read-only auditing of older links, no automatic
-  deletion, rewriting, blocking on redirect, background scans or migrations.
+- Offer bounded historical auditing: read-only CLI batches and an authenticated,
+  cursor-paginated native YOURLS admin page showing the current local policy
+  outcome and reason without exposing sensitive URL query data. Permit explicit
+  per-link HTTP verification only on operator request; never scan external
+  destinations, DNSBL or Web Risk simply by opening the admin page.
+- Allow a new **manual-only** exception for permanent deletion of an identified
+  older link after human review and a second confirmation. Re-check the exact
+  row, policy, definite verdict and anti-CSRF nonce before invoking native
+  YOURLS deletion, with a database transaction to prevent a concurrent update
+  from redirecting deletion to a different row. Never classify overlong
+  historical/generated aliases as an automatic deletion reason. Existing
+  links remain untouched without this explicit action: no automatic or mass
+  deletion, rewriting, redirect-time blocking, background scans or migrations.
 - Record privacy-preserving, diagnostic, bounded observations without leaking
   URL query tokens, credentials or costly excessive log/database writes.
 
@@ -59,7 +70,8 @@ redirects and customer data.
 - No guarantee against future Cloudflare or Google reputation flags.
   Operators remain responsible for handling reports of abuse.
 - Preserve the lrl.li homepage, branding, other plugins, credentials,
-  database schema and every existing short URL.
+  database schema and every existing short URL except those individually
+  and explicitly removed by an authorized admin through the manual review flow.
 
 ## Delivery and approval boundaries
 
