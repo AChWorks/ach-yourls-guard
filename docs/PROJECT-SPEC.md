@@ -41,7 +41,11 @@ redirects and customer data.
 ## Delivery and approval boundaries
 
 - Require PHP 8.5 and YOURLS 1.10.6 compatibility evidence, targeted
-  security/SSRF/redirect/permission tests and exact-candidate CI.
+  security/SSRF/redirect/permission tests and exact-candidate CI. Acceptance
+  includes a disposable MariaDB-backed installation with the three existing
+  plugin types, real loopback authenticated API/redirect checks, valid admin
+  form nonce and historical-audit read-only database snapshot. The flood-delay
+  override is fixture-only; the actual product retains native anti-flood.
 - Require an independent review before integrating or deploying security code.
 - Production Target ach-host-aapanel permits read-only inspection, but every
   potentially state-changing operation requires new, specific owner approval.

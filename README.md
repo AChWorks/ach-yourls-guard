@@ -1,6 +1,6 @@
 # ACh URL Guard for YOURLS
 
-An independent YOURLS plugin for safer creation of **new** short links. The implementation uses the supported `shunt_add_new_link` hook rather than modifying YOURLS core or depending on a fixed internal version. Validated with PHP 8.4/8.5 syntax and offline tests and the actual YOURLS 1.10.6 hook dispatcher. Full database-backed E2E and independent security approval are separate delivery gates. See [project specification](docs/PROJECT-SPEC.md).
+An independent YOURLS plugin for safer creation of **new** short links. The implementation uses the supported `shunt_add_new_link` hook rather than modifying YOURLS core or depending on a fixed internal version. Validated with PHP 8.4/8.5 syntax and offline/cURL-contract tests, and against a disposable YOURLS 1.10.6 + MariaDB installation with real HTTP API, redirects and the three existing plugin types. Independent security review and authorized Production rollout remain separate delivery gates. See [project specification](docs/PROJECT-SPEC.md).
 
 **No existing short links are ever deleted, modified, blocked on redirect, or rewritten by this plugin.** It does not change existing user credentials, admin login, branding, `Random ShortURLs`, `Allow Hyphens`, or the YOURLS database schema.
 
@@ -79,9 +79,12 @@ find src bin tests -name '*.php' -type f -exec php -l {} \;
 php tests/run.php
 php tests/curl-safety-contract.php
 YOURLS_SOURCE=/path/to/YOURLS-1.10.6 php tests/yourls-hook-contract.php
+YOURLS_SOURCE=/path/to/YOURLS-1.10.6 FORCE_LOWERCASE_SOURCE=/path/to/force-lowercase bash tests/db-integration.sh
 ```
 
-Coverage includes root-only URLs, exact/wildcard rules, private/reserved addresses, numeric aliases, dangerous redirect targets, valid redirects, HEAD/GET fallback, HTTP error handling, Google Web Risk and DNSBL mocks, unknown handling, and the YOURLS shunt/monitor/enforce contract. Network calls are mocked in the test harness, so no outside URLs are fetched. The cURL transport tests explicitly verify that failed option configuration never executes a network request and that DNS pinning, TLS and proxy restrictions are selected. The hook contract uses the actual upstream YOURLS filter implementation, without an active database.
+Coverage includes root-only URLs, exact/wildcard rules, private/reserved addresses, numeric aliases, dangerous redirect targets, valid redirects, HEAD/GET fallback, HTTP error handling, Google Web Risk and DNSBL mocks, unknown handling, and the YOURLS shunt/monitor/enforce contract. Network calls are mocked in the test harness, so no outside URLs are fetched. The cURL transport tests explicitly verify that failed option configuration never executes a network request and that DNS pinning, TLS and proxy restrictions are selected. The hook contract uses the actual upstream YOURLS filter implementation, without an active database. The separate database/HTTP integration test installs actual YOURLS 1.10.6 into a disposable MariaDB instance and isolated site, loads Random ShortURLs, Allow Hyphens, Force Lowercase and ACh URL Guard, verifies monitoring/enforcement, authenticated HTTP API allow/deny and HTTP status, existing/new redirect targets, protected admin settings, and compares a full database snapshot before/after the read-only historical audit. It never fetches an external test URL or points at Production.
+
+The integration script requires `mariadb-install-db`, `mariadbd`, PHP with `pdo_mysql` and `mysqli`, plus the two source checkouts. It uses an auto-generated local socket-only database and a private temporary directory (`TMPDIR` can select a filesystem with sufficient space), and tears down its resources on completion. GitHub Actions uses a loopback-only MariaDB service in the same test. The disposable fixture sets YOURLS's documented flood delay to zero to permit repeated rapid test creations; this does not change the site's anti-flood policy or the plugin code.
 
 ## Relationship to Force Lowercase
 

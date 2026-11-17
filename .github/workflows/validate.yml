@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+permissions:
+  contents: read
 jobs:
   php:
     runs-on: ubuntu-latest
@@ -10,6 +12,18 @@ jobs:
       fail-fast: false
       matrix:
         php: ['8.4', '8.5']
+    services:
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: local-integration-only
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -17,10 +31,15 @@ jobs:
           repository: YOURLS/YOURLS
           ref: 8220c8dd191e5f212bf5d77048e62975b2e2de4d
           path: upstream-yourls
+      - uses: actions/checkout@v4
+        with:
+          repository: YOURLS/force-lowercase
+          ref: ec5f34d068734f27e6f65b8333131bb37106d4dc
+          path: upstream-force-lowercase
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: curl, mysqli, intl
+          extensions: curl, mysqli, pdo_mysql, intl
           coverage: none
       - name: PHP syntax
         run: find . -path ./upstream-yourls -prune -o -name '*.php' -type f -exec php -l {} \;
@@ -30,3 +49,13 @@ jobs:
         run: php tests/curl-safety-contract.php
       - name: YOURLS 1.10.6 hook contract
         run: YOURLS_SOURCE="$PWD/upstream-yourls" php tests/yourls-hook-contract.php
+      - name: Isolated YOURLS 1.10.6 and MariaDB integration
+        env:
+          ACH_IT_EXTERNAL_DB: '1'
+          ACH_IT_DB_HOST: 127.0.0.1
+          ACH_IT_DB_USER: root
+          ACH_IT_DB_PASS: local-integration-only
+          ACH_IT_DB_PORT: '3306'
+          YOURLS_SOURCE: ${{ github.workspace }}/upstream-yourls
+          FORCE_LOWERCASE_SOURCE: ${{ github.workspace }}/upstream-force-lowercase
+        run: bash tests/db-integration.sh
