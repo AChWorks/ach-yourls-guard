@@ -57,8 +57,10 @@ function ach_url_guard_history_compact_parts(string $value, int $max = 80): arra
         return ['truncated' => false, 'head' => $value, 'tail' => ''];
     }
     $remaining = $max - strlen('[...]');
-    $head = (int) ceil($remaining * 0.7);
-    $tail = $remaining - $head;
+    // Reserve a short exact suffix so narrow mobile columns still show the
+    // prefix, the visible omission marker and the destination's final bytes.
+    $tail = min(10, max(3, (int) floor($remaining * 0.3)));
+    $head = $remaining - $tail;
     return [
         'truncated' => true,
         'head' => implode('', array_slice($chars, 0, $head)),

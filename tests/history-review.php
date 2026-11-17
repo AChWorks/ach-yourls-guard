@@ -172,6 +172,10 @@ check(substr_count($bracketHtml, 'class="ach-history-marker"') === 1
     && str_contains($bracketHtml, 'ach-history-suffix')
     && str_contains($bracketHtml, 'TAIL'),
     'pre-existing literal [...] does not confuse or hide the actual omission marker');
+$mobileParts = ach_url_guard_history_compact_parts(str_repeat('z', 500), 80);
+check($mobileParts['truncated'] && strlen($mobileParts['tail']) <= 10
+    && strlen($mobileParts['head']) > 0,
+    'narrow mobile value keeps a compact exact suffix and visible start');
 check(ach_url_guard_history_compact('https://example.org/') === 'https://example.org/',
     'short URL remains unchanged in display');
 check(str_contains(ach_url_guard_history_compact(str_repeat('مسیر', 40), 22), '[...]'),
