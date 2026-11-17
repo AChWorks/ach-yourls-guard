@@ -15,9 +15,11 @@ require_once __DIR__ . '/src/Policy.php';
 require_once __DIR__ . '/src/HttpProbe.php';
 require_once __DIR__ . '/src/Reputation.php';
 require_once __DIR__ . '/src/Guard.php';
+require_once __DIR__ . '/src/WorkGate.php';
 
 use ACh\Yourls\UrlGuard\Policy;
 use ACh\Yourls\UrlGuard\Guard;
+use ACh\Yourls\UrlGuard\WorkGate;
 
 // Admin is responsible for turning on enforcement; new installs start in monitor mode.
 yourls_add_filter('shunt_add_new_link', 'ach_url_guard_on_create', 10, 4);
@@ -40,9 +42,16 @@ function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
             // Deterministic input limit is independent of URL safety Monitor mode.
             $result = $keywordPolicy;
         } else {
-            $result = (new Guard())->evaluate($normalizedUrl, $settings, $secret);
-            if ($result['status'] === 'allow' && $keywordPolicy['status'] === 'deny') {
+            // Deterministic local denies remain enforceable even when costly
+            // validation is deferred by native-compatible work admission.
+            $quick = Policy::inspect($normalizedUrl, $settings, false);
+            if ($quick['status'] !== 'allow') {
+                $result = $quick;
+            } elseif ($keywordPolicy['status'] === 'deny') {
                 $result = $keywordPolicy;
+            } else {
+                $result = WorkGate::evaluate($normalizedUrl, $settings, $secret,
+                    static fn(): array => (new Guard())->evaluate($normalizedUrl, $settings, $secret));
             }
         }
     } catch (\Throwable $error) {
@@ -72,6 +81,8 @@ function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
         'keyword_too_long' => 'Custom short keyword exceeds the configured maximum of ' .
             $settings['max_custom_keyword_length'] . ' characters.',
         'regex_unavailable' => 'A URL rule could not be evaluated.',
+        'work_control_unavailable' => 'Destination validation is temporarily unavailable.',
+        'work_deferred' => 'Destination validation was deferred due to repeated requests.',
         'web_risk_threat' => 'This destination is flagged as unsafe.',
         'dnsbl_listed' => 'This destination is flagged by a spam list.',
         'http_not_found' => 'The requested destination was not found (HTTP 404/410).',
@@ -81,7 +92,8 @@ function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
         'guard_unavailable' => 'Destination verification is temporarily unavailable.',
     ];
     $reason = (string) ($result['reason'] ?? 'invalid_url');
-    $isTransient = in_array($reason, ['unverifiable_destination', 'guard_unavailable', 'regex_unavailable'], true);
+    $isTransient = in_array($reason, ['unverifiable_destination', 'guard_unavailable', 'regex_unavailable',
+        'work_control_unavailable', 'work_deferred'], true);
     $code = $reason === 'keyword_too_long' ? '400' : ($isTransient ? '503' : '403');
     return [
         'status' => 'fail',

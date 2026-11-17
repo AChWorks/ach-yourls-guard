@@ -113,7 +113,8 @@ define('YOURLS_COOKIEKEY', getenv('ACH_IT_COOKIE_KEY'));
 define('YOURLS_PRIVATE', true);
 define('YOURLS_URL_CONVERT', 36);
 // This isolated suite creates many links per second. Production retains native flood protection.
-define('YOURLS_FLOOD_DELAY_SECONDS', 0);
+// Fixture normally disables flood for rapid link insertions; final native-flood probes opt back in.
+define('YOURLS_FLOOD_DELAY_SECONDS', (int) (getenv('ACH_IT_FLOOD_DELAY') ?: '0'));
 define('YOURLS_DEBUG', false);
 $yourls_user_passwords = ['integration' => getenv('ACH_IT_ADMIN_PASS')];
 CONFIG
@@ -162,5 +163,18 @@ if ! run_php "$repo/tests/http-integration.php" verify; then
   tail -65 "$tmp/http.log" >&2
   exit 1
 fi
+
+# Prove admission works across distinct PHP processes with the real YOURLS
+# native flood policy enabled. Never call external HTTP/provider services.
+gate_before="$(run_php "$repo/tests/db-phase.php" snapshot)"
+for phase in first repeat different; do
+  ACH_IT_FLOOD_DELAY=15 ACH_IT_GATE_CASE="$phase" run_php "$repo/tests/db-phase.php" gate
+done
+gate_after="$(run_php "$repo/tests/db-phase.php" snapshot)"
+if [[ "$gate_before" != "$gate_after" ]]; then
+  echo 'Work admission changed YOURLS database state.' >&2
+  exit 1
+fi
+echo 'PASS native-delay admission: coalesced repeated rejected checks, deferred alternate URL, DB unchanged.'
 
 echo 'PASS isolated real YOURLS + MariaDB + HTTP integration (site and database removed)'

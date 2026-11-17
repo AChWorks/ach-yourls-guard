@@ -6,7 +6,7 @@ declare(strict_types=1);
  * database and an isolated YOURLS source copy. Never point this at production.
  */
 $phase = $argv[1] ?? '';
-if (!in_array($phase, ['ping', 'create', 'install', 'verify', 'snapshot', 'drop'], true)) {
+if (!in_array($phase, ['ping', 'create', 'install', 'verify', 'snapshot', 'drop', 'gate'], true)) {
     fwrite(STDERR, "Expected ping|create|install|verify|snapshot|drop.\n");
     exit(2);
 }
@@ -86,6 +86,36 @@ $expect(count($active) === 4, 'All four plugins must remain active.');
 $expect(function_exists('ozh_random_shorturl'), 'Random ShortURLs loaded.');
 $expect(function_exists('ozh_hyphen_in_charset'), 'Allow Hyphens loaded.');
 $expect(function_exists('ozh_break_the_web_lowercase'), 'Force Lowercase loaded.');
+
+// This phase runs as three independent CLI processes against one disposable
+// YOURLS database. Native flood delay is enabled only for this focused probe.
+if ($phase === 'gate') {
+    $expect(yourls_get_flood_delay() === 15, 'Must use normal native 15-second flood policy.');
+    $expect(yourls_is_private(), 'Fixture should have native private mode.');
+    $expect(yourls_is_valid_user() !== true, 'This test is not a logged-in privileged admin.');
+    $mode = (string) getenv('ACH_IT_GATE_CASE');
+    $expect(in_array($mode, ['first', 'repeat', 'different'], true), 'Expected one gate phase.');
+    $verifyCount = 0;
+    $work = static function () use (&$verifyCount): array {
+        $verifyCount++;
+        return ['status' => 'deny', 'reason' => 'http_not_found', 'host' => 'example.com'];
+    };
+    $url = $mode === 'different' ? 'https://example.com/other' : 'https://example.com/rejected';
+    $guardSettings = \ACh\Yourls\UrlGuard\Policy::settings(['reachability_enabled' => true]);
+    $result = \ACh\Yourls\UrlGuard\WorkGate::evaluate(
+        $url, $guardSettings, '', $work, '203.0.113.250', null, false, $site . '/.work-admission-fixture'
+    );
+    if ($mode === 'different') {
+        $expect(($result['reason'] ?? '') === 'work_deferred', 'Fresh URL must defer extra costly work.');
+        $expect($verifyCount === 0, 'New URL during native delay must not execute costly probe.');
+    } else {
+        $expect(($result['reason'] ?? '') === 'http_not_found', 'Must preserve initial deny verdict.');
+        $expect($verifyCount === ($mode === 'first' ? 1 : 0),
+            'Repeated rejected request must reuse result across PHP processes.');
+    }
+    echo "PASS real YOURLS native-delay work admission ($mode), expensive executions=$verifyCount.\n";
+    exit(0);
+}
 
 $knownBefore = $pdo->query("SELECT url FROM yourls_url WHERE keyword='yourlsblog'")->fetchColumn();
 $expect(is_string($knownBefore) && $knownBefore !== '', 'Pre-existing link is present.');

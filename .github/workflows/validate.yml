@@ -26,6 +26,24 @@ jobs:
           --health-retries=20
     steps:
       - uses: actions/checkout@v4
+        with:
+          # pull_request normally checks out a synthetic merge SHA.
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Assert literal candidate HEAD and GitHub tree
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse HEAD)"
+          actual_tree="$(git rev-parse HEAD^{tree})"
+          expected_tree="$(gh api "repos/$SOURCE_REPOSITORY/git/commits/$EXPECTED_HEAD" --jq '.tree.sha')"
+          test "$actual_head" = "$EXPECTED_HEAD"
+          test "$actual_tree" = "$expected_tree"
+          echo "Verified literal HEAD=$actual_head TREE=$actual_tree"
       - uses: actions/checkout@v4
         with:
           repository: YOURLS/YOURLS

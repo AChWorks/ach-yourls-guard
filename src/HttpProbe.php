@@ -29,7 +29,9 @@ final class HttpProbe
         for ($hop = 0; $hop <= $settings['max_redirects']; $hop++) {
             $policy = Policy::inspect($url, $settings);
             if ($policy['status'] !== 'allow') {
-                return self::withChain(['status' => 'deny', 'reason' => $policy['reason'], 'final_url' => $url, 'hops' => $hop], $visited);
+                // Local PCRE budget exhaustion is an explicit unknown, not a
+                // definite bad destination; preserve the operator's policy.
+                return self::withChain(['status' => $policy['status'], 'reason' => $policy['reason'], 'final_url' => $url, 'hops' => $hop], $visited);
             }
             if (isset($visited[$url])) {
                 return self::withChain(['status' => 'unknown', 'reason' => 'redirect_loop', 'final_url' => $url], $visited);
@@ -50,26 +52,11 @@ final class HttpProbe
                 $valid[] = $ip;
             }
             $valid = array_values(array_unique($valid));
-            $response = ($this->requester)($url, $valid, 'HEAD', $settings);
+            // Real link navigation uses GET. A HEAD 200 can conceal a GET-only
+            // redirect to a prohibited or private destination. Bounded GET
+            // observes the actual redirect route and needs no fallback request.
+            $response = ($this->requester)($url, $valid, 'GET', $settings);
             $code = (int) ($response['http_code'] ?? 0);
-            // Some hosts return 404/403/405 for HEAD even when GET succeeds.
-            // A bounded GET fallback avoids false rejections based on HEAD alone.
-            if (($code >= 400 && $code <= 499) || $code === 501 || $code === 0) {
-                $fallback = ($this->requester)($url, $valid, 'GET', $settings);
-                if ((int) ($fallback['http_code'] ?? 0) > 0) {
-                    $response = $fallback;
-                    $code = (int) $response['http_code'];
-                } elseif ($code === 404 || $code === 410) {
-                    // HEAD may be rejected or served differently from GET. If
-                    // GET cannot be completed, absence is not established.
-                    return self::withChain([
-                        'status' => 'unknown',
-                        'reason' => 'get_fallback_failed',
-                        'final_url' => $url,
-                        'head_http_code' => $code,
-                    ], $visited);
-                }
-            }
             if ($code >= 300 && $code < 400) {
                 if (empty($response['location'])) {
                     return self::withChain(['status' => 'unknown', 'reason' => 'redirect_without_location', 'final_url' => $url], $visited);

@@ -26,7 +26,19 @@ redirects and customer data.
   or existing aliases.
 - Consider confirmed HTTP 404/410 meaningful absence. Treat 403/429/5xx,
   authentication challenges and network failure as inconclusive rather
-  than definitely malicious or missing.
+  than definitely malicious or missing. Validate the actual bounded GET
+  redirect chain, including each per-hop URL, DNS and IP policy; HEAD 200
+  does not establish safety of GET.
+- Bound operator-configured PCRE match work, recursion and evaluated input
+  size. Report budget exhaustion as an explicit unknown rather than a clean
+  nonmatch; never impose a global maximum destination URL length.
+- Before costly PCRE, DNS, HTTP or provider checks on the pre-flood shunt,
+  reuse YOURLS native flood admission, and coalesce repeated rejected work.
+  Defer other costly work during the native delay without imposing an
+  unrelated rate limit; honor native private-admin/IP exemptions. Deferred
+  decisions follow the established operator unknown policy. Store only
+  hashed fingerprints and small verdicts in bounded private temporary
+  state, never full URLs/keys or extra schema/cron state.
 - Preserve native YOURLS anti-flood and interoperability with Random ShortURLs,
   Allow Hyphens and Force Lowercase, existing aliases and case-sensitive URL paths.
 - Offer bounded manual read-only auditing of older links, no automatic
@@ -55,9 +67,12 @@ redirects and customer data.
   plugin types, real loopback authenticated API/redirect checks, valid admin
   form nonce and historical-audit read-only database snapshot. Validate the
   custom alias cap, zero disable, default denylist behavior, URL phrases,
-  regex syntax/atomic admin save, reserved aliases, native API HTTP status,
-  and intact existing links. The flood-delay override is fixture-only;
-  the actual product retains native anti-flood.
+  regex syntax/atomic admin save and resource budgeting, reserved aliases,
+  GET-only redirect behavior, native API HTTP status, and intact existing
+  links. Rapid fixture creation disables native flood only for that phase;
+  separate tests enable real native flood delay and verify cross-process
+  work admission. PR CI must assert literal candidate SHA and GitHub tree,
+  never substitute the synthetic merge commit for exact-HEAD evidence.
 - Require an independent review before integrating or deploying security code.
 - Production environments permit only explicitly authorized operations;
   every potentially state-changing operation requires specific owner approval.

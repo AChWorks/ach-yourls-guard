@@ -6,6 +6,10 @@ namespace ACh\Yourls\UrlGuard;
 /** Side-effect-free host, path and operator denylist policy. */
 final class Policy
 {
+    // This is a per-pattern evaluation budget, NOT a maximum URL length.
+    // Over-budget URLs follow the operator's configured unknown policy.
+    private const REGEX_SUBJECT_BUDGET_BYTES = 65536;
+
     public static function defaults(): array
     {
         return [
@@ -181,7 +185,42 @@ final class Policy
         return null;
     }
 
-    public static function inspect(string $input, array $settings): array
+    /**
+     * Run operator PCRE under a per-call budget; restore host PHP settings.
+     * Never mistake a PCRE limit/error for a verified non-match.
+     */
+    public static function boundedPatternMatch(string $pattern, string $subject): ?bool
+    {
+        if (strlen($subject) > self::REGEX_SUBJECT_BUDGET_BYTES) {
+            return null;
+        }
+        $oldBacktrack = ini_get('pcre.backtrack_limit');
+        $oldRecursion = ini_get('pcre.recursion_limit');
+        $oldJit = ini_get('pcre.jit');
+        if ($oldBacktrack === false || $oldRecursion === false || $oldJit === false) {
+            return null;
+        }
+        $backtrack = min((int) $oldBacktrack, 10000);
+        $recursion = min((int) $oldRecursion, 1000);
+        if (@ini_set('pcre.backtrack_limit', (string) $backtrack) === false ||
+            @ini_set('pcre.recursion_limit', (string) $recursion) === false ||
+            @ini_set('pcre.jit', '0') === false) {
+            @ini_set('pcre.backtrack_limit', $oldBacktrack);
+            @ini_set('pcre.recursion_limit', $oldRecursion);
+            @ini_set('pcre.jit', $oldJit);
+            return null;
+        }
+        try {
+            $match = @preg_match($pattern, $subject);
+            return ($match !== false && preg_last_error() === PREG_NO_ERROR) ? $match === 1 : null;
+        } finally {
+            @ini_set('pcre.backtrack_limit', $oldBacktrack);
+            @ini_set('pcre.recursion_limit', $oldRecursion);
+            @ini_set('pcre.jit', $oldJit);
+        }
+    }
+
+    public static function inspect(string $input, array $settings, bool $includePatterns = true): array
     {
         $url = trim($input);
         if (!filter_var($url, FILTER_VALIDATE_URL)) {
@@ -235,29 +274,29 @@ final class Policy
                 return self::verdict('deny', 'blocked_url_term', $host);
             }
         }
-        foreach ($settings['blocked_url_patterns'] ?? [] as $pattern) {
-            $rawMatch = @preg_match((string) $pattern, $url);
-            if ($rawMatch === false) {
-                return self::verdict(
-                    ($settings['unknown_action'] ?? 'allow') === 'deny' ? 'deny' : 'unknown',
-                    'regex_unavailable',
-                    $host
-                );
-            }
-            if ($rawMatch === 1) {
-                return self::verdict('deny', 'blocked_url_pattern', $host);
-            }
-            if ($decoded !== $url) {
-                $decodedMatch = @preg_match((string) $pattern, $decoded);
-                if ($decodedMatch === false) {
+        if ($includePatterns) {
+            foreach ($settings['blocked_url_patterns'] ?? [] as $pattern) {
+                $rawMatch = self::boundedPatternMatch((string) $pattern, $url);
+                if ($rawMatch === null) {
                     return self::verdict(
                         ($settings['unknown_action'] ?? 'allow') === 'deny' ? 'deny' : 'unknown',
-                        'regex_unavailable',
-                        $host
+                        'regex_unavailable', $host
                     );
                 }
-                if ($decodedMatch === 1) {
+                if ($rawMatch) {
                     return self::verdict('deny', 'blocked_url_pattern', $host);
+                }
+                if ($decoded !== $url) {
+                    $decodedMatch = self::boundedPatternMatch((string) $pattern, $decoded);
+                    if ($decodedMatch === null) {
+                        return self::verdict(
+                            ($settings['unknown_action'] ?? 'allow') === 'deny' ? 'deny' : 'unknown',
+                            'regex_unavailable', $host
+                        );
+                    }
+                    if ($decodedMatch) {
+                        return self::verdict('deny', 'blocked_url_pattern', $host);
+                    }
                 }
             }
         }
