@@ -20,10 +20,14 @@ redirects and customer data.
   Support operator-defined literal URL phrases, validated full-URL PCRE,
   and exact reserved custom short aliases. Optionally reject bare/root
   destinations, including root with query arguments, with explicit exceptions.
-- Enforce a configurable maximum length for user-chosen short aliases,
-  default 20 characters and 0 to disable, even in Monitor. Measure the
-  YOURLS-sanitized alias; never cap target URL lengths, generated codes
-  or existing aliases.
+- Enforce operator-configurable minimum and maximum lengths for newly
+  submitted custom short aliases, including in Monitor. The minimum defaults
+  to 0 (disabled); the maximum defaults to 20 (0 disables). Require the
+  minimum not to exceed an enabled (nonzero) maximum. Reject invalid numeric
+  settings atomically, never partially saving them. Both bounds count the
+  YOURLS-sanitized keyword's characters, not destination URL bytes. Never
+  cap target URL lengths, generated codes or existing aliases. Old-link
+  review must ignore both new-link-only bounds as reasons for deletion.
 - Consider confirmed HTTP 404/410 meaningful absence. Treat 403/429/5xx,
   authentication challenges and network failure as inconclusive rather
   than definitely malicious or missing. Validate the actual bounded GET

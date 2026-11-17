@@ -152,6 +152,7 @@ $settings = \ACh\Yourls\UrlGuard\Policy::settings([
     'blocked_url_terms' => ['casino'],
     'blocked_url_patterns' => ['~/(?:offer|sale)(?:/|$)~i'],
     'blocked_short_keywords' => ['reserved'],
+    'min_custom_keyword_length' => 5,
     'max_custom_keyword_length' => 20,
 ]);
 $expect(yourls_update_option('ach_url_guard_settings', $settings), 'Must save enforce settings to real DB.');
@@ -170,15 +171,22 @@ foreach ([
     ['https://example.com/p/CaSiNo-2026', 'deny-term', 'blocked_url_term'],
     ['https://example.com/OFFER/123', 'deny-regex', 'blocked_url_pattern'],
     ['https://example.com/valid-page', 'reserved', 'blocked_short_keyword'],
+    ['https://example.com/valid-page', 'four', 'keyword_too_short'],
     ['https://example.com/valid-page', 'abcdefghijklmnopqrstu', 'keyword_too_long'],
 ] as [$url, $keyword, $reason]) {
     $result = $try($url, $keyword);
     $expect(($result['status'] ?? '') === 'fail', 'Must deny ' . $reason);
     $expect(($result['code'] ?? '') === 'error:ach_url_guard:' . $reason, 'Must identify reason ' . $reason);
-    $expect(($result['errorCode'] ?? '') === ($reason === 'keyword_too_long' ? '400' : '403'),
-        'Must use correct status for ' . $reason);
+    $expect(($result['errorCode'] ?? '') === (
+        in_array($reason, ['keyword_too_short', 'keyword_too_long'], true) ? '400' : '403'
+    ), 'Must use correct status for ' . $reason);
 }
 $expect(count($table()) === $rowsBeforeDenials, 'Denied creates must never persist rows.');
+$exactMinimum = $try('https://example.com/custom-keyword-five-test', 'abcde');
+$expect(($exactMinimum['status'] ?? '') === 'success',
+    'A five-character custom keyword succeeds in native YOURLS when minimum is five.');
+$expect($pdo->query("SELECT COUNT(*) FROM yourls_url WHERE keyword='abcde'")->fetchColumn() == 1,
+    'Exactly-minimum custom keyword is stored without unexpected rewriting.');
 
 foreach ([
     ['https://trusted.example/', 'allowed-exception'],
@@ -247,6 +255,7 @@ $expect(yourls_get_option('ach_url_guard_settings', []) === $settings, 'Invalid 
 $_POST['blocked_url_patterns'] = '~/(?:offer|sale)(?:/|$)~i';
 $_POST['blocked_url_terms'] = 'casino';
 $_POST['blocked_short_keywords'] = 'reserved';
+$_POST['min_custom_keyword_length'] = '5';
 $_POST['max_custom_keyword_length'] = '20';
 ob_start();
 ach_url_guard_admin_page();
@@ -254,6 +263,7 @@ $validHtml = ob_get_clean();
 $expect(str_contains($validHtml, 'Settings saved.'), 'Valid admin POST with actual nonce must save.');
 $expect((yourls_get_option('ach_url_guard_settings', [])['mode'] ?? '') === 'enforce', 'Saved mode persists.');
 $saved = yourls_get_option('ach_url_guard_settings', []);
+$expect(($saved['min_custom_keyword_length'] ?? null) === 5, 'Custom keyword minimum persists.');
 $expect(($saved['max_custom_keyword_length'] ?? null) === 20, 'Custom keyword cap persists.');
 $expect(($saved['blocked_url_terms'] ?? null) === ['casino'], 'Literal URL terms persist.');
 $expect(($saved['blocked_url_patterns'] ?? null) === ['~/(?:offer|sale)(?:/|$)~i'], 'PCRE patterns persist.');
@@ -269,6 +279,11 @@ $historyDB = yourls_get_db('read-history_integration');
 $historyPolicy = \ACh\Yourls\UrlGuard\Policy::settings(
     yourls_get_option('ach_url_guard_settings', [])
 );
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::inspect([
+    'keyword' => 'abc', 'url' => 'https://example.com/valid-page',
+    'timestamp' => '2026-01-01 00:00:00', 'clicks' => 0, 'title' => ''
+], $historyPolicy)['status'] === 'allow',
+    'Existing three-character keyword is not condemned by new-link-only minimum.');
 $baselineHistory = $pdo->query('SELECT keyword,url,title FROM yourls_url ORDER BY keyword')->fetchAll(PDO::FETCH_ASSOC);
 $historyPage = \ACh\Yourls\UrlGuard\HistoricalReview::page($historyDB, '', 25);
 $expect(count($historyPage['rows']) > 0, 'Historical browser must return real YOURLS URL rows.');

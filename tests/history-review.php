@@ -152,6 +152,12 @@ $_SERVER['REQUEST_METHOD'] = 'GET'; $_POST = [];
 check(HistoricalReview::inspect($db->rows['bad'], $settings)['reason'] === 'blocked_domain', 'blocked domain flagged');
 check(HistoricalReview::inspect($db->rows['home'], $settings)['reason'] === 'root_url', 'homepage-only flagged');
 check(HistoricalReview::inspect($db->rows['safe'], $settings)['status'] === 'allow', 'safe path allowed');
+$historicalMin = $settings;
+$historicalMin['min_custom_keyword_length'] = 8;
+check(HistoricalReview::inspect($db->rows['safe'], $historicalMin)['status'] === 'allow',
+    'existing short keyword stays valid despite the new custom minimum');
+check(HistoricalReview::inspect($db->rows['bad'], $historicalMin)['reason'] === 'blocked_domain',
+    'old-link review still flags definite destination reasons when min is enabled');
 $strictUnknown = Policy::settings(['unknown_action' => 'deny',
     'blocked_url_patterns' => ['~example\\.com~']]);
 $overBudget = $makeRow('expensive-url', 'https://example.com/long/' . str_repeat('a', 70000));

@@ -85,6 +85,7 @@ foreach ([
     ['https://example.com/casino/slot', 'http-term', 'blocked_url_term', 403],
     ['https://example.com/OFFER/2026', 'http-regex', 'blocked_url_pattern', 403],
     ['https://example.com/safe', 'reserved', 'blocked_short_keyword', 403],
+    ['https://example.com/safe', 'four', 'keyword_too_short', 400],
     ['https://example.com/safe', 'abcdefghijklmnopqrstu', 'keyword_too_long', 400],
 ] as [$url, $keyword, $reason, $expectedHttp]) {
     [$httpCode, , $body] = $request('/yourls-api.php', $credentials + ['url' => $url, 'keyword' => $keyword]);
@@ -93,6 +94,14 @@ foreach ([
         'Actual authenticated HTTP API must reject ' . $reason);
     $expect($httpCode === $expectedHttp, 'Actual HTTP status must match ' . $reason);
 }
+
+[$httpCode, , $body] = $request('/yourls-api.php', $credentials + [
+    'url' => 'https://example.com/HTTP/ExactMin', 'keyword' => 'five5',
+]);
+$exactMin = json_decode($body, true);
+$expect(is_array($exactMin) && ($exactMin['status'] ?? '') === 'success'
+    && ($exactMin['url']['keyword'] ?? '') === 'five5' && $httpCode === 200,
+    'Authenticated native HTTP API accepts a custom keyword exactly at minimum length.');
 
 [$httpCode, , $body] = $request('/yourls-api.php', $credentials + [
     'url' => 'https://example.com/HTTP/CaseSensitive?abc=XYZ', 'keyword' => 'HTTP-UPPER',

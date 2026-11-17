@@ -21,7 +21,9 @@ final class Policy
             'blocked_url_terms' => [],
             'blocked_url_patterns' => [],
             'blocked_short_keywords' => [],
-            // 0 explicitly disables the custom-alias cap.
+            // Zero disables the minimum; existing installations remain unchanged.
+            'min_custom_keyword_length' => 0,
+            // Zero disables the maximum; custom aliases alone are bounded.
             'max_custom_keyword_length' => 20,
             'reachability_enabled' => false,
             'unknown_action' => 'allow',
@@ -66,6 +68,7 @@ final class Policy
         $result['request_timeout_seconds'] = max($result['connect_timeout_seconds'], min(60, $result['request_timeout_seconds']));
         $result['max_redirects'] = max(0, min(12, $result['max_redirects']));
         $result['recent_event_count'] = max(0, min(2000, $result['recent_event_count']));
+        $result['min_custom_keyword_length'] = max(0, $result['min_custom_keyword_length']);
         $result['max_custom_keyword_length'] = max(0, $result['max_custom_keyword_length']);
         return $result;
     }
@@ -138,8 +141,12 @@ final class Policy
         }
         $length = preg_match_all('/./us', $keyword);
         $length = $length === false ? strlen($keyword) : $length;
-        $limit = (int) ($settings['max_custom_keyword_length'] ?? 0);
-        if ($limit > 0 && $length > $limit) {
+        $minimum = (int) ($settings['min_custom_keyword_length'] ?? 0);
+        if ($minimum > 0 && $length < $minimum) {
+            return self::verdict('deny', 'keyword_too_short');
+        }
+        $maximum = (int) ($settings['max_custom_keyword_length'] ?? 0);
+        if ($maximum > 0 && $length > $maximum) {
             return self::verdict('deny', 'keyword_too_long');
         }
         foreach ($settings['blocked_short_keywords'] ?? [] as $term) {
