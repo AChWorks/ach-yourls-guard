@@ -97,6 +97,10 @@ fi
 # All test file writes are confined to this fresh temporary site.
 mkdir "$ACH_IT_SITE"
 cp -a "$upstream/." "$ACH_IT_SITE/"
+# Upstream YOURLS intentionally has no root index.php; the public front page
+# is an optional sample. Install that sample only in this disposable fixture
+# so public-mode reachability is exercised without a custom Production UI.
+cp "$upstream/sample-public-front-page.txt" "$ACH_IT_SITE/index.php"
 mkdir -p "$ACH_IT_SITE/user/plugins/force-lowercase" "$ACH_IT_SITE/user/plugins/ach-url-guard"
 cp "$force/plugin.php" "$ACH_IT_SITE/user/plugins/force-lowercase/plugin.php"
 cp "$repo/plugin.php" "$ACH_IT_SITE/user/plugins/ach-url-guard/plugin.php"

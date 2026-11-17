@@ -392,7 +392,10 @@ final class BulkHistory
                 $check = $checks[$keyword];
                 $latest = HistoricalReview::find($db, $keyword, true);
                 $reason = (string) $candidate['reason'];
-                $approved = $latest !== null && $check['row'] !== null
+                // Native YOURLS deletion sanitizes the keyword; never let a
+                // legacy alias be rewritten to another key during deletion.
+                $approved = $keyword === yourls_sanitize_keyword($keyword)
+                    && $latest !== null && $check['row'] !== null
                     && $check['decision'] !== null
                     && ($check['decision']['reason'] ?? '') === $reason
                     && hash_equals((string) $candidate['row_proof'], $check['proof'])
