@@ -22,6 +22,7 @@ function yourls_update_option($name, $value) { global $options; $options[$name] 
 class FakeDb { public function add_plugin_page($slug, $title, $fn) { global $pages; $pages[$slug] = [$title, $fn]; } }
 function yourls_get_db($context = '') { return new FakeDb(); }
 function yourls_sanitize_url($url) { return $url; }
+function yourls_sanitize_keyword($keyword, $restrict = false) { return strtolower(preg_replace('/[^a-zA-Z0-9-]/', '', (string) $keyword)); }
 function yourls_get_IP() { throw new RuntimeException('reached_native_pipeline'); }
 
 require dirname(__DIR__) . '/plugin.php';

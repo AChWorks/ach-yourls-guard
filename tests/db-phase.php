@@ -95,6 +95,12 @@ $expect(($allowed['status'] ?? '') === 'success', 'Monitor must allow normal cre
 $expect(($allowed['url']['keyword'] ?? '') === 'upper-link', 'Force Lowercase and Allow Hyphens keep custom keyword working.');
 $stored = $pdo->query("SELECT url FROM yourls_url WHERE keyword='upper-link'")->fetchColumn();
 $expect($stored === 'https://example.com/MiXeD/Path?token=secret', 'Destination path and query case unchanged.');
+$overlongAlias = yourls_add_new_link('https://example.com/Allowed/LongAlias', '123456789012345678901', 'Rejected in Monitor');
+$expect(($overlongAlias['code'] ?? '') === 'error:ach_url_guard:keyword_too_long',
+    'Custom alias over 20 characters must be rejected even in Monitor.');
+$expect(($overlongAlias['errorCode'] ?? '') === '400', 'Alias length reject is a bad request, not a service failure.');
+$exactAlias = yourls_add_new_link('https://example.com/Allowed/ExactAlias', '12345678901234567890', '20-character alias');
+$expect(($exactAlias['status'] ?? '') === 'success', 'Exactly 20-character alias succeeds in Monitor.');
 
 $monitor = yourls_add_new_link('https://example.com/?sensitive=not-for-logs', 'monitor-root', 'Monitor root');
 $expect(($monitor['status'] ?? '') === 'success', 'Monitor must not prevent a root destination.');
@@ -102,12 +108,21 @@ $events = yourls_get_option('ach_url_guard_events', []);
 $expect(is_array($events) && count($events) > 0, 'Real database must contain sampled monitoring event.');
 $expect(($events[0]['reason'] ?? '') === 'root_url', 'Root destination reason recorded.');
 $expect(!str_contains(serialize($events), 'not-for-logs'), 'No URL query tokens persist in event payload.');
+$chainedInMonitor = yourls_add_new_link('https://bit.ly/retarget', 'monitor-chain', 'Monitor proposed shortener block');
+$expect(($chainedInMonitor['status'] ?? '') === 'success',
+    'Starter domain list is observed but does not block in Monitor.');
+$expect((yourls_get_option('ach_url_guard_events', [])[0]['reason'] ?? '') === 'blocked_domain',
+    'Starter shortener domain is reported.');
 
 $settings = \ACh\Yourls\UrlGuard\Policy::settings([
     'mode' => 'enforce',
     'block_root_urls' => true,
     'blocked_domains' => ['bad.example', '.bad-parent.example', '*.bad-children.example'],
     'root_exceptions' => ['trusted.example'],
+    'blocked_url_terms' => ['casino'],
+    'blocked_url_patterns' => ['~/(?:offer|sale)(?:/|$)~i'],
+    'blocked_short_keywords' => ['reserved'],
+    'max_custom_keyword_length' => 20,
 ]);
 $expect(yourls_update_option('ach_url_guard_settings', $settings), 'Must save enforce settings to real DB.');
 $rowsBeforeDenials = count($table());
@@ -122,17 +137,23 @@ foreach ([
     ['https://sub.bad-parent.example/path', 'deny-child', 'blocked_domain'],
     ['https://sub.bad-children.example/path', 'deny-wildcard', 'blocked_domain'],
     ['https://127.0.0.1/private', 'deny-local', 'private_address'],
+    ['https://example.com/p/CaSiNo-2026', 'deny-term', 'blocked_url_term'],
+    ['https://example.com/OFFER/123', 'deny-regex', 'blocked_url_pattern'],
+    ['https://example.com/valid-page', 'reserved', 'blocked_short_keyword'],
+    ['https://example.com/valid-page', 'abcdefghijklmnopqrstu', 'keyword_too_long'],
 ] as [$url, $keyword, $reason]) {
     $result = $try($url, $keyword);
     $expect(($result['status'] ?? '') === 'fail', 'Must deny ' . $reason);
     $expect(($result['code'] ?? '') === 'error:ach_url_guard:' . $reason, 'Must identify reason ' . $reason);
+    $expect(($result['errorCode'] ?? '') === ($reason === 'keyword_too_long' ? '400' : '403'),
+        'Must use correct status for ' . $reason);
 }
 $expect(count($table()) === $rowsBeforeDenials, 'Denied creates must never persist rows.');
 
 foreach ([
     ['https://trusted.example/', 'allowed-exception'],
-    ['https://sub.bad.example/Page', 'allowed-child-of-exact'],
-    ['https://bad-children.example/Page', 'allowed-apex-of-wildcard'],
+    ['https://sub.bad.example/Page', 'allowed-child-exact'],
+    ['https://bad-children.example/Page', 'allowed-apex-wild'],
 ] as [$url, $keyword]) {
     $result = $try($url, $keyword);
     $expect(($result['status'] ?? '') === 'success', 'Rule exceptions and exact semantics must permit ' . $keyword);
@@ -179,14 +200,29 @@ $_POST = [
 ob_start();
 ach_url_guard_admin_page();
 $invalidHtml = ob_get_clean();
-$expect(str_contains($invalidHtml, 'Invalid domain rule'), 'Invalid admin rules must not save.');
+$expect(str_contains($invalidHtml, 'Invalid settings'), 'Invalid admin rules must not save.');
 $expect(yourls_get_option('ach_url_guard_settings', []) === $settings, 'Invalid form must preserve existing settings.');
 $_POST['blocked_domains'] = "bad.example\n.bad-parent.example\n*.bad-children.example";
+$_POST['blocked_url_patterns'] = '/[broken/';
+ob_start();
+ach_url_guard_admin_page();
+$invalidRegexHtml = ob_get_clean();
+$expect(str_contains($invalidRegexHtml, 'blocked_url_patterns'), 'Invalid PCRE must be reported to admin.');
+$expect(yourls_get_option('ach_url_guard_settings', []) === $settings, 'Invalid regex cannot partially save settings.');
+$_POST['blocked_url_patterns'] = '~/(?:offer|sale)(?:/|$)~i';
+$_POST['blocked_url_terms'] = 'casino';
+$_POST['blocked_short_keywords'] = 'reserved';
+$_POST['max_custom_keyword_length'] = '20';
 ob_start();
 ach_url_guard_admin_page();
 $validHtml = ob_get_clean();
 $expect(str_contains($validHtml, 'Settings saved.'), 'Valid admin POST with actual nonce must save.');
 $expect((yourls_get_option('ach_url_guard_settings', [])['mode'] ?? '') === 'enforce', 'Saved mode persists.');
+$saved = yourls_get_option('ach_url_guard_settings', []);
+$expect(($saved['max_custom_keyword_length'] ?? null) === 20, 'Custom keyword cap persists.');
+$expect(($saved['blocked_url_terms'] ?? null) === ['casino'], 'Literal URL terms persist.');
+$expect(($saved['blocked_url_patterns'] ?? null) === ['~/(?:offer|sale)(?:/|$)~i'], 'PCRE patterns persist.');
+$expect(($saved['blocked_short_keywords'] ?? null) === ['reserved'], 'Custom reserved aliases persist.');
 $_POST = [];
 $_SERVER['REQUEST_METHOD'] = 'GET';
 

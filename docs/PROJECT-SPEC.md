@@ -15,8 +15,15 @@ redirects and customer data.
   reachability. Evaluate each redirect and DNS answer before network access;
   pin approved IP addresses against rebinding.
 - Maintain admin-managed domain rules (exact apex, apex plus children, or
-  children only). Optionally reject bare/root destinations, including root
-  with query arguments, with explicit exceptions.
+  children only); a small editable starter set of well-known URL shorteners
+  is monitored by default, not represented as a verified malicious list.
+  Support operator-defined literal URL phrases, validated full-URL PCRE,
+  and exact reserved custom short aliases. Optionally reject bare/root
+  destinations, including root with query arguments, with explicit exceptions.
+- Enforce a configurable maximum length for user-chosen short aliases,
+  default 20 characters and 0 to disable, even in Monitor. Measure the
+  YOURLS-sanitized alias; never cap target URL lengths, generated codes
+  or existing aliases.
 - Consider confirmed HTTP 404/410 meaningful absence. Treat 403/429/5xx,
   authentication challenges and network failure as inconclusive rather
   than definitely malicious or missing.
@@ -29,8 +36,10 @@ redirects and customer data.
 
 ## Settled policy / non-goals
 
-- Default to Monitor; enabling Enforce and denying unknown outcomes need
-  explicit owner policy approval after monitoring.
+- Default to Monitor for destination safety; only the deterministic custom
+  alias length cap is immediately enforced. Domain/phrase/Regex/reserved alias
+  rules are observational until Enforce. Enabling Enforce and denying unknown
+  outcomes need explicit owner policy approval after monitoring.
 - Google APIs and external DNSBL requests remain disabled; no vendor
   signup, new credentials, billing, silent external calls or cron jobs.
 - No guarantee against future Cloudflare or Google reputation flags.
@@ -44,11 +53,14 @@ redirects and customer data.
   security/SSRF/redirect/permission tests and exact-candidate CI. Acceptance
   includes a disposable MariaDB-backed installation with the three existing
   plugin types, real loopback authenticated API/redirect checks, valid admin
-  form nonce and historical-audit read-only database snapshot. The flood-delay
-  override is fixture-only; the actual product retains native anti-flood.
+  form nonce and historical-audit read-only database snapshot. Validate the
+  custom alias cap, zero disable, default denylist behavior, URL phrases,
+  regex syntax/atomic admin save, reserved aliases, native API HTTP status,
+  and intact existing links. The flood-delay override is fixture-only;
+  the actual product retains native anti-flood.
 - Require an independent review before integrating or deploying security code.
-- Production Target ach-host-aapanel permits read-only inspection, but every
-  potentially state-changing operation requires new, specific owner approval.
+- Production environments permit only explicitly authorized operations;
+  every potentially state-changing operation requires specific owner approval.
   A previous general installation request does not replace this requirement.
 - An authorized rollout installs only the reviewed plugin and activates
   Monitor. External APIs, Enforce, background scans and destructive changes

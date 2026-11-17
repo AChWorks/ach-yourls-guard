@@ -6,7 +6,9 @@ An independent YOURLS plugin for safer creation of **new** short links. The impl
 
 ## Features
 
-- Exact hostname denylist (not substring matching); explicit `example.com`, `.example.com` and `*.example.com` matching.
+- **Custom short keyword length:** maximum characters for a user-chosen alias after the domain (default **20**, `0` disables); enforced in Monitor and Enforce, without capping full destination URLs or generated short aliases.
+- Editable exact/apex/subdomain denylist (`example.com`, `.example.com`, `*.example.com`).
+- Local operator-managed plain-text URL phrases, optional full-URL PCRE regex patterns, and exact reserved custom short keywords; no external provider or rule feed required.
 - Disallow destination URLs whose effective path is empty or root (`/`, `/?x=1`, `/./`, `/%2e/`). Configurable exceptions for known trustworthy sites.
 - URL syntax and public HTTP(S) only; reject embedded credentials and clearly private/local/reserved IPs, including ambiguous numeric-IP encodings.
 - Optional reachability check using bounded HEAD, with GET fallback for HEAD-rejecting sites. `404/410` is a clear negative; `403`, `429`, `5xx`, DNS timeout and provider errors are **inconclusive**, not proof of malware or a missing page.
@@ -18,7 +20,9 @@ An independent YOURLS plugin for safer creation of **new** short links. The impl
 
 ## Defaults and production gate
 
-New installations default to **Monitor only**, with root-path rule prepared but *not enforced*, reachability checks off, DNSBL off, Web Risk off, and no blocked domains. This avoids silently restricting public creation or adding external costs. To deploy actual protections, the operator must explicitly select **Enforce** and enable the desired checks. `unknown_action=allow` remains the default; to reject unverified destinations, an operator can choose strict unknown handling, acknowledging that bot-protected sites might be falsely rejected.
+New installations default to **Monitor** for destination-safety rules, with root-path checks prepared, reachability off, DNSBL off and Web Risk off. The editable starter domain denylist contains `.bit.ly`, `.tinyurl.com`, `.cutt.ly` and `.is.gd` to discourage nested shortened links. These are popular URL shorteners, **not a verified list of malicious sites**. They are only blocked when an operator enables **Enforce**, and all entries can be removed. Destination phrase/regex rules also follow Monitor/Enforce.
+
+**Exception:** the requested custom short alias cap defaults to **20 characters** and is enforced in **both Monitor and Enforce**. It measures the YOURLS-sanitized keyword after the domain, not the destination URL length. Setting `max_custom_keyword_length` to `0` disables this added cap, leaving native YOURLS keyword validation intact. The operator must explicitly choose **Enforce** before any domain/URL-safety rules reject newly submitted destinations. `unknown_action=allow` remains the default; strict handling of unverifiable URLs is optional and may cause false positives.
 
 In enforcement mode, clearly invalid URLs and explicit denylist/known-threat matches are rejected. Uncertain network/provider results follow the operator's selected policy.
 
@@ -31,6 +35,16 @@ bad.example
 ```
 
 The first line matches only the apex, the second matches apex plus children, and the third matches only children. Lines beginning with `#` are comments. The `root_exceptions` list uses exactly the same grammar. Blacklisted-domain rules take precedence over root exceptions. A URL with no path but query parameters counts as root. Domain matching is case-insensitive, but path and query strings are not altered.
+
+## Local phrase, Regex and reserved-keyword rules
+
+The YOURLS admin page exposes three additional multiline inputs:
+
+- **Blocked phrases within destination URLs:** one literal phrase per line. For instance, `casino` also matches `CASINO` anywhere in the destination hostname, path or query, including once-percent-decoded text. This is substring matching, so choose terms carefully to avoid false positives.
+- **Blocked destination URL patterns (Regex):** one complete PHP/PCRE pattern per line, including delimiters. Example: `~^https?://(?:[^/]+\.)?example\.com/ads(?:/|$)~i`. The entire URL and once-decoded URL are checked. Invalid regex syntax is rejected on save without partially updating the settings. Patterns are an advanced trusted-admin option: overly broad or expensive patterns can reject legitimate links or consume CPU. Empty by default.
+- **Reserved custom short keywords:** one exact short alias per line, such as `support`. In Enforce, `lrl.li/support` is blocked, but `lrl.li/supporters` is not. The alias length cap is separate. Empty by default.
+
+Lines beginning with `#` are ignored as comments. All rules are local, editable, use no external API and only examine newly created links (and redirect hops when reachability checking is enabled). Existing links and redirect behavior are not altered.
 
 ## Google Web Risk
 
@@ -53,7 +67,7 @@ Google Safe Browsing API is restricted to non-commercial use; this package does 
 1. Review/test this package, then place the entire directory as `user/plugins/ach-url-guard/` in the intended YOURLS installation. Keep the existing three active plugins unchanged.
 2. PHP syntax-check the package; inspect its file ownership and permissions.
 3. Enable **ACh URL Guard** from YOURLS **Manage Plugins**. Its default is monitoring; normal link creation and existing redirects must still work.
-4. Open **Plugins → ACh URL Guard**. Configure the root rule, denylist, optional reachability and external providers. Review monitoring output before moving to **Enforce**.
+4. Open **Plugins → ACh URL Guard**. Review the editable starter denylist, set the custom short alias cap (20 by default, 0 to disable), and optionally add local phrase/Regex/reserved alias rules. Review URL safety events in Monitor before selecting **Enforce**.
 5. Test representative allowed, root-only, blocked-domain, known 404, HTTPS and redirect cases, including an existing short link and administrator login.
 6. To roll back, deactivate the plugin through YOURLS or rename its directory if the admin page becomes unavailable. It does not mutate existing link records. Any persistent monitoring options may be retained without affecting the site.
 
@@ -64,7 +78,7 @@ Google Safe Browsing API is restricted to non-commercial use; this package does 
 Run from the installed plugin path, using the private CLI session:
 
 ```bash
-php bin/audit.php --site=/www/acdomains/lrl.li --limit=200 --after=LAST_KEYWORD
+php bin/audit.php --site=/path/to/yourls --limit=200 --after=LAST_KEYWORD
 ```
 
 Options: `--network` checks HTTPS reachability; `--reputation` uses Google Web Risk if a key is configured. These flags can generate external requests/costs; without them it is purely a structural/domain-policy audit. Results are CSV on STDOUT; progress and next cursor go to STDERR. By default this scans a finite batch of 200, and the operator can choose their own batch size. Protect exported CSV because destination URL query strings may contain sensitive material.
@@ -82,7 +96,7 @@ YOURLS_SOURCE=/path/to/YOURLS-1.10.6 php tests/yourls-hook-contract.php
 YOURLS_SOURCE=/path/to/YOURLS-1.10.6 FORCE_LOWERCASE_SOURCE=/path/to/force-lowercase bash tests/db-integration.sh
 ```
 
-Coverage includes root-only URLs, exact/wildcard rules, private/reserved addresses, numeric aliases, dangerous redirect targets, valid redirects, HEAD/GET fallback, HTTP error handling, Google Web Risk and DNSBL mocks, unknown handling, and the YOURLS shunt/monitor/enforce contract. Network calls are mocked in the test harness, so no outside URLs are fetched. The cURL transport tests explicitly verify that failed option configuration never executes a network request and that DNS pinning, TLS and proxy restrictions are selected. The hook contract uses the actual upstream YOURLS filter implementation, without an active database. The separate database/HTTP integration test installs actual YOURLS 1.10.6 into a disposable MariaDB instance and isolated site, loads Random ShortURLs, Allow Hyphens, Force Lowercase and ACh URL Guard, verifies monitoring/enforcement, authenticated HTTP API allow/deny and HTTP status, existing/new redirect targets, protected admin settings, and compares a full database snapshot before/after the read-only historical audit. It never fetches an external test URL or points at Production.
+Coverage includes the default anti-chaining domain rules, custom alias cap in Monitor/Enforce and 0-disable behavior, local URL terms/Regex and reserved aliases, invalid admin-rule rejection and real HTTP API status checks, as well as root-only URLs, exact/wildcard rules, private/reserved addresses, numeric aliases, dangerous redirect targets, valid redirects, HEAD/GET fallback, HTTP error handling, Google Web Risk and DNSBL mocks, unknown handling, and the YOURLS shunt/monitor/enforce contract. Network calls are mocked in the test harness, so no outside URLs are fetched. The cURL transport tests explicitly verify that failed option configuration never executes a network request and that DNS pinning, TLS and proxy restrictions are selected. The hook contract uses the actual upstream YOURLS filter implementation, without an active database. The separate database/HTTP integration test installs actual YOURLS 1.10.6 into a disposable MariaDB instance and isolated site, loads Random ShortURLs, Allow Hyphens, Force Lowercase and ACh URL Guard, verifies monitoring/enforcement, authenticated HTTP API allow/deny and HTTP status, existing/new redirect targets, protected admin settings, and compares a full database snapshot before/after the read-only historical audit. It never fetches an external test URL or points at Production.
 
 The integration script requires `mariadb-install-db`, `mariadbd`, PHP with `pdo_mysql` and `mysqli`, plus the two source checkouts. It uses an auto-generated local socket-only database and a private temporary directory (`TMPDIR` can select a filesystem with sufficient space), and tears down its resources on completion. GitHub Actions uses a loopback-only MariaDB service in the same test. The disposable fixture sets YOURLS's documented flood delay to zero to permit repeated rapid test creations; this does not change the site's anti-flood policy or the plugin code.
 

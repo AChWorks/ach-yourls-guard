@@ -61,6 +61,19 @@ $expect(is_array($denied) && ($denied['status'] ?? '') === 'fail', 'Authenticate
 $expect(($denied['code'] ?? '') === 'error:ach_url_guard:blocked_domain', 'Actual endpoint deny reason must match policy.');
 $expect($httpCode === 403, 'Blocked API result must return HTTP 403.');
 
+foreach ([
+    ['https://example.com/casino/slot', 'http-term', 'blocked_url_term', 403],
+    ['https://example.com/OFFER/2026', 'http-regex', 'blocked_url_pattern', 403],
+    ['https://example.com/safe', 'reserved', 'blocked_short_keyword', 403],
+    ['https://example.com/safe', 'abcdefghijklmnopqrstu', 'keyword_too_long', 400],
+] as [$url, $keyword, $reason, $expectedHttp]) {
+    [$httpCode, , $body] = $request('/yourls-api.php', $credentials + ['url' => $url, 'keyword' => $keyword]);
+    $denied = json_decode($body, true);
+    $expect(is_array($denied) && ($denied['code'] ?? '') === 'error:ach_url_guard:' . $reason,
+        'Actual authenticated HTTP API must reject ' . $reason);
+    $expect($httpCode === $expectedHttp, 'Actual HTTP status must match ' . $reason);
+}
+
 [$httpCode, , $body] = $request('/yourls-api.php', $credentials + [
     'url' => 'https://example.com/HTTP/CaseSensitive?abc=XYZ', 'keyword' => 'HTTP-UPPER',
 ]);

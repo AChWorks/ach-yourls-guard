@@ -26,7 +26,11 @@ function status(string $url, array $settings): string
     return Policy::inspect($url, $settings)['reason'];
 }
 $settings = Policy::settings([]);
-eq('monitor', $settings['mode'], 'default mode must not block');
+eq('monitor', $settings['mode'], 'default mode must not block URL policies');
+eq(20, $settings['max_custom_keyword_length'], 'default custom short keyword cap');
+eq(['.bit.ly', '.tinyurl.com', '.cutt.ly', '.is.gd'], $settings['blocked_domains'], 'editable shortener-chain starter list');
+eq('blocked_domain', status('https://sub.bit.ly/path', $settings), 'starter list matches an existing shortening service');
+eq('policy_pass', status('https://example.com/page', $settings), 'starter list does not block ordinary domains');
 eq('root_url', status('https://example.com', $settings), 'empty root');
 eq('root_url', status('https://example.com/?q=foo', $settings), 'query root');
 eq('root_url', status('https://example.com/', $settings), 'slash root');
@@ -62,6 +66,33 @@ eq('root_url', status('https://not-trusted.example', $settings), 'root rule stil
 $settings['block_root_urls'] = false;
 eq('policy_pass', status('https://example.com/', $settings), 'root rule configurable');
 $settings['block_root_urls'] = true;
+
+$filters = Policy::settings([
+    'block_root_urls' => false,
+    'blocked_domains' => [],
+    'blocked_url_terms' => "casino\n# comment\nBad Offer\ncasino",
+    'blocked_url_patterns' => ['~/(?:sale|offer)(?:/|$)~i'],
+    'blocked_short_keywords' => "admin\nSupport",
+]);
+eq(['casino', 'Bad Offer'], $filters['blocked_url_terms'], 'plain URL terms parsed, deduplicated and comment-free');
+eq('blocked_url_term', status('https://example.com/sAFE/CaSiNo/shop', $filters), 'case-insensitive term in path');
+eq('blocked_url_term', status('https://example.com/ok?q=bad%20offer', $filters), 'decoded term in query');
+eq('blocked_url_pattern', status('https://example.com/OFFER/123', $filters), 'operator PCRE matches full URL');
+eq('policy_pass', status('https://example.com/safepage', $filters), 'nonmatching phrase and regex allowed');
+eq(['~/(?:sale|offer)(?:/|$)~i'], $filters['blocked_url_patterns'], 'regex line preserved intact');
+eq(['/[broken/'], Policy::invalidPatterns('/[broken/'), 'invalid PCRE rejected on admin save');
+eq([], Policy::invalidPatterns('~/(?:sale|offer)(?:/|$)~i'), 'valid PCRE accepted');
+eq('keyword_too_long', Policy::inspectKeyword('abcdefghijklmnopqrstu', $filters)['reason'], '21-character custom alias rejected');
+eq('keyword_pass', Policy::inspectKeyword('abcdefghijklmnopqrst', $filters)['reason'], '20-character alias accepted');
+eq('blocked_short_keyword', Policy::inspectKeyword('SUPPORT', $filters)['reason'], 'reserved alias exact insensitive match');
+eq('keyword_pass', Policy::inspectKeyword('supporter', $filters)['reason'], 'reserved alias does not block substrings');
+eq('keyword_too_long', Policy::inspectKeyword(str_repeat('ژ', 21), $filters)['reason'], 'UTF-8 characters counted, not bytes');
+$filters['max_custom_keyword_length'] = 0;
+eq('keyword_pass', Policy::inspectKeyword('abcdefghijklmnopqrstu', $filters)['reason'], 'operator disables cap with 0');
+$broken = Policy::settings(['block_root_urls' => false, 'blocked_domains' => [], 'blocked_url_patterns' => '/[broken/']);
+eq('regex_unavailable', status('https://example.com/p', $broken), 'corrupted stored regex is visible as unknown');
+$broken['unknown_action'] = 'deny';
+eq('deny', Policy::inspect('https://example.com/p', $broken)['status'], 'strict unknown policy applies to untestable regex');
 
 eq('https://example.com/a/new', HttpProbe::resolveLocation('https://example.com/a/page', 'new'), 'relative redirect');
 eq('https://example.com/new', HttpProbe::resolveLocation('https://example.com/a/page', '../new'), 'parent redirect');
@@ -118,6 +149,11 @@ eq('private_address', $probe->check('https://example.com/to-private', $settings)
 eq('root_url', $probe->check('https://example.com/to-root', $settings)['reason'], 'root policy on final redirect');
 eq('http_success', $probe->check('https://example.com/to-page', $settings)['reason'], 'relative redirect followed safely');
 eq('redirect_loop', $probe->check('https://example.com/to-loop', $settings)['reason'], 'redirect loop');
+$redirectRules = $settings;
+$redirectRules['blocked_url_terms'] = ['unsafe.example'];
+eq('blocked_url_term', $probe->check('https://example.com/to-intermediate', $redirectRules)['reason'],
+    'local content rules must also prevent redirect hops reaching forbidden destinations');
+
 $before = count($requests);
 eq('private_dns_address', $probe->check('https://internal.example/data', $settings)['reason'], 'reject mixed public/private DNS');
 eq($before, count($requests), 'no request to private DNS');
@@ -180,6 +216,9 @@ function yourls_add_action($name, $callable): void {global $hooks;$hooks[] = [$n
 function yourls_get_option($name, $default = false) {global $fakeOptions;return $fakeOptions[$name] ?? $default;}
 function yourls_update_option($name, $value): void {global $fakeOptions, $eventWrites;$fakeOptions[$name] = $value;if ($name === 'ach_url_guard_events') $eventWrites++;}
 function yourls_sanitize_url($url): string {return $url;}
+function yourls_sanitize_keyword($keyword, $restrict = false): string {
+    return $restrict ? strtolower(preg_replace('/[^a-zA-Z0-9-]/', '', (string) $keyword)) : (string) $keyword;
+}
 function yourls_create_nonce($action): string {return 'fake-test-nonce';}
 function yourls_verify_nonce($action, $nonce = false): void {global $lastNonce; $lastNonce = $nonce;}
 function yourls_register_plugin_page($slug, $title, $function): void {}
@@ -198,23 +237,50 @@ for ($attempt = 0; $attempt < 100; $attempt++) {
 }
 eq(2, count($fakeOptions['ach_url_guard_events']), 'monitoring samples repeated same-second decisions');
 eq(2, $eventWrites, 'repeated abusive decisions do not amplify DB writes');
+$fakeOptions['ach_url_guard_settings'] = ['mode' => 'monitor', 'block_root_urls' => false, 'blocked_domains' => []];
+$limitFail = ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'abcdefghijklmnopqrstu');
+eq('error:ach_url_guard:keyword_too_long', $limitFail['code'], 'length cap enforced in Monitor');
+eq('400', $limitFail['errorCode'], 'alias length failure uses HTTP 400');
+eq($sentinel, ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'abcdefghijklmnopqrst'), 'exactly 20 characters allowed');
+$fakeOptions['ach_url_guard_settings']['blocked_short_keywords'] = ['support'];
+eq($sentinel, ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'SUPPORT'), 'Monitor does not block reserved alias');
+$fakeOptions['ach_url_guard_settings']['mode'] = 'enforce';
+$blockedShort = ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'SUPPORT');
+eq('error:ach_url_guard:blocked_short_keyword', $blockedShort['code'], 'Enforce rejects reserved alias');
+$fakeOptions['ach_url_guard_settings']['max_custom_keyword_length'] = 0;
+eq($sentinel, ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'abcdefghijklmnopqrstu'), '0 turns off the alias cap');
 $_SERVER['REQUEST_METHOD'] = 'GET';
 ob_start();
 ach_url_guard_admin_page();
 $adminHtml = ob_get_clean();
 eq(true, strpos($adminHtml, 'Monitor only') !== false, 'admin has monitor setting');
+eq(true, strpos($adminHtml, 'name="max_custom_keyword_length"') !== false,
+    'alias length cap visibly configurable in admin settings');
 eq(true, strpos($adminHtml, 'Enforce: reject definite violations') !== false, 'admin has enforcement setting');
 eq(true, strpos($adminHtml, 'Web Risk API key:') !== false, 'admin displays key readiness');
 eq(true, strpos($adminHtml, 'Recent sampled decisions') !== false, 'admin shows audit evidence');
 $_SERVER['REQUEST_METHOD'] = 'POST';
 $_POST = ['ach_url_guard_save' => '1', 'mode' => 'enforce', 'blocked_domains' => 'invalid domain', 'root_exceptions' => '', 'dnsbl_zones' => ''];
 ob_start(); ach_url_guard_admin_page(); $badHtml = ob_get_clean();
-eq(true, strpos($badHtml, 'Invalid domain rule(s)') !== false, 'invalid rule is visible to operator');
+eq(true, strpos($badHtml, 'Invalid settings') !== false, 'invalid rule is visible to operator');
 eq('enforce', $fakeOptions['ach_url_guard_settings']['mode'], 'enforce mode unchanged by invalid input');
-$_POST = ['ach_url_guard_save' => '1', 'nonce' => 'fake-test-nonce', 'mode' => 'monitor', 'blocked_domains' => '.Bad.Example', 'root_exceptions' => '', 'dnsbl_zones' => ''];
+$_POST = ['ach_url_guard_save' => '1', 'nonce' => 'fake-test-nonce', 'mode' => 'enforce',
+    'blocked_domains' => '.Bad.Example', 'root_exceptions' => '', 'dnsbl_zones' => '',
+    'blocked_url_patterns' => '/[broken/'];
+ob_start(); ach_url_guard_admin_page(); $badPatternHtml = ob_get_clean();
+eq(true, strpos($badPatternHtml, 'blocked_url_patterns') !== false, 'invalid regex shown, no settings saved');
+eq('enforce', $fakeOptions['ach_url_guard_settings']['mode'], 'invalid regex preserves previous settings');
+$_POST = ['ach_url_guard_save' => '1', 'nonce' => 'fake-test-nonce', 'mode' => 'monitor',
+    'blocked_domains' => '.Bad.Example', 'root_exceptions' => '', 'dnsbl_zones' => '',
+    'blocked_url_terms' => 'casino', 'blocked_url_patterns' => '~/(?:sale|offer)~i',
+    'blocked_short_keywords' => 'SUPPORT', 'max_custom_keyword_length' => '25'];
 ob_start(); ach_url_guard_admin_page(); $okHtml = ob_get_clean();
 eq(true, strpos($okHtml, 'Settings saved') !== false, 'admin saves valid rules');
 eq('fake-test-nonce', $lastNonce, 'admin passes explicit POST nonce to YOURLS verifier');
 eq(['.bad.example'], $fakeOptions['ach_url_guard_settings']['blocked_domains'], 'stored rule canonicalized');
+eq(25, $fakeOptions['ach_url_guard_settings']['max_custom_keyword_length'], 'max alias length saved from admin');
+eq(['casino'], $fakeOptions['ach_url_guard_settings']['blocked_url_terms'], 'URL phrases saved from admin');
+eq(['~/(?:sale|offer)~i'], $fakeOptions['ach_url_guard_settings']['blocked_url_patterns'], 'PCRE patterns saved from admin');
+eq(['SUPPORT'], $fakeOptions['ach_url_guard_settings']['blocked_short_keywords'], 'reserved aliases saved from admin');
 
 printf("PASS %d assertions, offline, no live data altered\n", $tests);

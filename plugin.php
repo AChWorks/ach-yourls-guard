@@ -1,7 +1,7 @@
 <?php
 /*
 Plugin Name: ACh URL Guard
-Plugin URI: https://lrl.li
+Plugin URI: https://github.com/AChWorks/ach-yourls-guard
 Description: Configurable safe URL validation, exact domain rules, monitored reachability, and optional threat intelligence. Never deletes existing URLs.
 Version: 0.1.0
 Author: ACh
@@ -29,7 +29,22 @@ function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
     $normalizedUrl = yourls_sanitize_url((string) $url);
     $secret = defined('ACH_URL_GUARD_WEB_RISK_KEY') ? (string) ACH_URL_GUARD_WEB_RISK_KEY : '';
     try {
-        $result = (new Guard())->evaluate($normalizedUrl, $settings, $secret);
+        // Only custom short keywords are user-provided; YOURLS generates normal
+        // aliases separately. Use the core sanitizer to count what would be saved.
+        $normalizedKeyword = is_scalar($keyword) ? (string) $keyword : '';
+        if ($normalizedKeyword !== '') {
+            $normalizedKeyword = yourls_sanitize_keyword($normalizedKeyword, true);
+        }
+        $keywordPolicy = Policy::inspectKeyword($normalizedKeyword, $settings);
+        if ($keywordPolicy['reason'] === 'keyword_too_long') {
+            // Deterministic input limit is independent of URL safety Monitor mode.
+            $result = $keywordPolicy;
+        } else {
+            $result = (new Guard())->evaluate($normalizedUrl, $settings, $secret);
+            if ($result['status'] === 'allow' && $keywordPolicy['status'] === 'deny') {
+                $result = $keywordPolicy;
+            }
+        }
     } catch (\Throwable $error) {
         // A plugin crash must not cause a fatal on the public shortener.
         // Never leak URL, API keys, exception messages or backend internals.
@@ -43,13 +58,20 @@ function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
     if ($result['status'] !== 'allow') {
         ach_url_guard_record_event($normalizedUrl, $result, $settings);
     }
-    if ($settings['mode'] !== 'enforce' || $result['status'] !== 'deny') {
+    if (($result['reason'] ?? '') !== 'keyword_too_long' &&
+        ($settings['mode'] !== 'enforce' || $result['status'] !== 'deny')) {
         // Identity return is essential: YOURLS shunts on *any* other value.
         return $original;
     }
     $messages = [
         'root_url' => 'Homepage-only URLs cannot be shortened. Please provide a page path.',
         'blocked_domain' => 'This domain is not allowed.',
+        'blocked_url_term' => 'This destination contains a prohibited phrase.',
+        'blocked_url_pattern' => 'This destination matches a prohibited URL rule.',
+        'blocked_short_keyword' => 'This custom short keyword is reserved.',
+        'keyword_too_long' => 'Custom short keyword exceeds the configured maximum of ' .
+            $settings['max_custom_keyword_length'] . ' characters.',
+        'regex_unavailable' => 'A URL rule could not be evaluated.',
         'web_risk_threat' => 'This destination is flagged as unsafe.',
         'dnsbl_listed' => 'This destination is flagged by a spam list.',
         'http_not_found' => 'The requested destination was not found (HTTP 404/410).',
@@ -59,8 +81,8 @@ function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
         'guard_unavailable' => 'Destination verification is temporarily unavailable.',
     ];
     $reason = (string) ($result['reason'] ?? 'invalid_url');
-    $isTransient = in_array($reason, ['unverifiable_destination', 'guard_unavailable'], true);
-    $code = $isTransient ? '503' : '403';
+    $isTransient = in_array($reason, ['unverifiable_destination', 'guard_unavailable', 'regex_unavailable'], true);
+    $code = $reason === 'keyword_too_long' ? '400' : ($isTransient ? '503' : '403');
     return [
         'status' => 'fail',
         'code' => 'error:ach_url_guard:' . $reason,
@@ -129,7 +151,7 @@ function ach_url_guard_admin_page(): void
     if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['ach_url_guard_save'])) {
         yourls_verify_nonce('ach_url_guard_settings', isset($_POST['nonce']) && is_string($_POST['nonce']) ? $_POST['nonce'] : '');
         $raw = [];
-        foreach (['mode', 'unknown_action', 'connect_timeout_seconds', 'request_timeout_seconds', 'max_redirects', 'recent_event_count'] as $name) {
+        foreach (['mode', 'unknown_action', 'connect_timeout_seconds', 'request_timeout_seconds', 'max_redirects', 'recent_event_count', 'max_custom_keyword_length'] as $name) {
             if (isset($_POST[$name]) && is_scalar($_POST[$name])) {
                 $raw[$name] = $_POST[$name];
             }
@@ -137,7 +159,7 @@ function ach_url_guard_admin_page(): void
         foreach (['block_root_urls', 'reachability_enabled', 'web_risk_enabled', 'dnsbl_enabled'] as $name) {
             $raw[$name] = isset($_POST[$name]) ? '1' : '0';
         }
-        foreach (['blocked_domains', 'root_exceptions', 'dnsbl_zones'] as $name) {
+        foreach (['blocked_domains', 'root_exceptions', 'dnsbl_zones', 'blocked_url_terms', 'blocked_url_patterns', 'blocked_short_keywords'] as $name) {
             $raw[$name] = isset($_POST[$name]) && is_string($_POST[$name]) ? $_POST[$name] : '';
         }
         $errors = [];
@@ -156,8 +178,21 @@ function ach_url_guard_admin_page(): void
                 }
             }
         }
+        foreach (Policy::invalidPatterns($raw['blocked_url_patterns']) as $pattern) {
+            $errors[] = 'blocked_url_patterns: ' . $pattern;
+        }
+        foreach (Policy::textLines($raw['blocked_short_keywords']) as $shortKeyword) {
+            if (strcasecmp($shortKeyword, yourls_sanitize_keyword($shortKeyword, true)) !== 0) {
+                $errors[] = 'blocked_short_keywords: ' . $shortKeyword;
+            }
+        }
+        if (isset($raw['max_custom_keyword_length']) &&
+            (filter_var($raw['max_custom_keyword_length'], FILTER_VALIDATE_INT) === false ||
+                (int) $raw['max_custom_keyword_length'] < 0)) {
+            $errors[] = 'max_custom_keyword_length: must be a nonnegative integer';
+        }
         if ($errors !== []) {
-            $feedback = 'Invalid domain rule(s), nothing saved: ' . implode('; ', $errors);
+            $feedback = 'Invalid settings, nothing saved: ' . implode('; ', $errors);
         } else {
             $settings = Policy::settings($raw);
             yourls_update_option('ach_url_guard_settings', $settings);
@@ -184,6 +219,11 @@ function ach_url_guard_admin_page(): void
         echo '<option value="' . $value . '"' . ($settings['mode'] === $value ? ' selected' : '') . '>' . ach_url_guard_esc($label) . '</option>';
     }
     echo '</select></label></p>';
+    echo '<p><small>Monitor reports destination safety decisions without blocking them. The custom short keyword length limit applies in both modes.</small></p>';
+    echo '<p><label><strong>Maximum custom short keyword characters:</strong> ';
+    echo '<input type="number" name="max_custom_keyword_length" min="0" value="' .
+        ach_url_guard_esc($settings['max_custom_keyword_length']) . '" /></label>';
+    echo '<br /><small>20 by default. 0 disables this limit; excludes domain, destination URL and generated aliases.</small></p>';
     foreach ([
         'block_root_urls' => 'Disallow homepage-only destinations (including /?query=...)',
         'reachability_enabled' => 'Check destination HTTP status and each redirect hop',
@@ -198,7 +238,10 @@ function ach_url_guard_admin_page(): void
     }
     echo '</select></label></p>';
     foreach ([
-        'blocked_domains' => ['Blocked domains, one per line', 'example.com blocks only the apex; .example.com blocks apex and subdomains; *.example.com blocks subdomains only.'],
+        'blocked_domains' => ['Blocked domains, one per line', 'Editable starter set blocks nesting known shorteners (such as bit.ly and tinyurl.com) only in Enforce. example.com = apex; .example.com = apex and subdomains; *.example.com = subdomains only.'],
+        'blocked_url_terms' => ['Blocked phrases within destination URLs', 'One literal phrase per line; ASCII case-insensitive, matches host, path and query, including percent-encoded text.'],
+        'blocked_url_patterns' => ['Blocked destination URL patterns (Regex)', 'One complete PCRE regex per line, including delimiters and optional flags, e.g. ~^https?://[^/]+/offer~i. Invalid patterns are rejected on save.'],
+        'blocked_short_keywords' => ['Reserved custom short keywords', 'One exact short alias per line, case-insensitive. URL safety mode controls enforcement of this list.'],
         'root_exceptions' => ['Homepage-only URL exceptions, one domain per line', 'Accept homepage-only links only for approved hosts.'],
         'dnsbl_zones' => ['DNSBL zones, one per line', 'Domain-oriented DNSBL providers require their own usage terms and functioning resolver. Empty = no DNSBL lookups.'],
     ] as $name => $spec) {
