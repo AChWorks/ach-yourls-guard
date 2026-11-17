@@ -213,6 +213,7 @@ function ach_url_guard_bulk_ajax_status(): void
         echo json_encode([
             'ok' => true, 'id' => $id, 'phase' => $job['phase'],
             'updated' => (string) ($job['updated_at'] ?? ''),
+            'stale' => (strtotime((string) ($job['updated_at'] ?? '')) ?: 0) < time() - 120,
             'scanned' => (int) $job['scanned'], 'matched' => (int) $job['matched'],
             'processed' => (int) $job['processed'], 'deleted' => (int) $job['deleted'],
             'skipped' => (int) $job['skipped'], 'html' => $html,
@@ -232,19 +233,19 @@ function ach_url_guard_bulk_poll_script(string $id): void
     echo '<script>(function(){'
         . 'var box=document.getElementById("ach-bulk-live");if(!box)return;'
         . 'var endpoint=' . json_encode($endpoint, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_QUOT | JSON_HEX_APOS)
-        . ';var signature="",timer=null,failures=0;'
+        . ';var signature="",failures=0;'
         . 'var message=document.getElementById("ach-bulk-poll-message");'
-        . 'function again(){timer=setTimeout(poll,3000)}'
+        . 'function again(delay){setTimeout(poll,delay||3000)}'
         . 'function poll(){fetch(endpoint,{credentials:"same-origin",cache:"no-store"})'
         . '.then(function(r){if(!r.ok)throw new Error("status "+r.status);return r.json()})'
         . '.then(function(d){if(!d.ok||typeof d.html!=="string")throw new Error("invalid status");'
         . 'failures=0;if(message)message.textContent="";'
-        . 'var next=[d.phase,d.updated,d.scanned,d.matched,d.processed,d.deleted,d.skipped].join("|");'
+        . 'var next=[d.phase,d.updated,d.stale,d.scanned,d.matched,d.processed,d.deleted,d.skipped].join("|");'
         . 'if(next!==signature&&!box.contains(document.activeElement)){box.innerHTML=d.html;signature=next;}'
         . 'if(d.phase==="scan"||d.phase==="delete"){again()}})'
         . '.catch(function(){failures++;if(message)message.textContent='
-        . '"Live progress is unavailable; the server job is saved. Reopen this page to retry.";'
-        . 'if(failures<5)again()})}'
+        . '"Live progress is unavailable; reconnecting automatically. The server job is saved.";'
+        . 'again(Math.min(30000,3000*Math.pow(2,Math.min(failures,4))))})}'
         . 'poll()})();</script>';
 }
 

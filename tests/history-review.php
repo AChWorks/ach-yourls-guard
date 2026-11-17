@@ -434,6 +434,8 @@ ob_start();ach_url_guard_bulk_poll_script($jobUi['id']);$pollJS=ob_get_clean();
 check(str_contains($pollJS, 'admin-ajax.php?action=ach_guard_bulk_status')
     && str_contains($pollJS, 'fetch(endpoint')
     && str_contains($pollJS, 'box.innerHTML=d.html')
+    && str_contains($pollJS, 'd.stale')
+    && str_contains($pollJS, 'reconnecting automatically')
     && !str_contains($pollJS, 'location.reload(')
     && !str_contains($pollJS, 'form.submit('),
     'live progress polls JSON and updates a card without page reload');

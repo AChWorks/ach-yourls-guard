@@ -127,6 +127,7 @@ if (str_starts_with($phase, 'background-')) {
         $expect(is_array($status) && ($status['ok'] ?? null) === true
             && ($status['phase'] ?? '') === 'ready'
             && ($status['deleted'] ?? -1) === 0
+            && is_bool($status['stale'] ?? null)
             && str_contains((string) ($status['html'] ?? ''), 'DELETE 1')
             && str_contains((string) ($status['html'] ?? ''), 'Start confirmed background deletion'),
             'Authenticated admin AJAX status returns ready form without writing');
