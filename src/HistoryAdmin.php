@@ -42,10 +42,10 @@ function ach_url_guard_history_reason_label(string $reason): string
 }
 
 /** Abbreviate only the visible label; the Copy control keeps the exact value. */
-function ach_url_guard_history_compact_parts(string $value, int $max = 80): array
+function ach_url_guard_history_compact_parts(string $value, int $max = 80, bool $force = false): array
 {
     $max = max(16, $max);
-    if (strlen($value) <= $max) {
+    if (!$force && strlen($value) <= $max) {
         return ['truncated' => false, 'head' => $value, 'tail' => ''];
     }
     $chars = preg_split('//u', $value, -1, PREG_SPLIT_NO_EMPTY);
@@ -53,14 +53,15 @@ function ach_url_guard_history_compact_parts(string $value, int $max = 80): arra
     if ($chars === false) {
         $chars = str_split($value);
     }
-    if (count($chars) <= $max) {
+    $count = count($chars);
+    if (($count <= $max && !$force) || $count < 3) {
         return ['truncated' => false, 'head' => $value, 'tail' => ''];
     }
-    $remaining = $max - strlen('[...]');
-    // Reserve a short exact suffix so narrow mobile columns still show the
-    // prefix, the visible omission marker and the destination's final bytes.
-    $tail = min(10, max(3, (int) floor($remaining * 0.3)));
-    $head = $remaining - $tail;
+    // The compact alternative is prebuilt even for medium-length values.
+    // JavaScript chooses it only if the ORIGINAL rendered width exceeds its
+    // actual container; no fixed character count decides visible overflow.
+    $tail = min(10, max(1, (int) floor($count * 0.3)), $count - 2);
+    $head = min($count - $tail - 1, max(1, $max - strlen('[...]') - $tail));
     return [
         'truncated' => true,
         'head' => implode('', array_slice($chars, 0, $head)),
@@ -75,15 +76,120 @@ function ach_url_guard_history_compact(string $value, int $max = 80): string
 }
 
 /** Keep [...] and the suffix visible even when a narrow column clips the prefix. */
-function ach_url_guard_history_compact_html(string $value, int $max = 80): string
+function ach_url_guard_history_compact_html(string $value, int $max = 80, bool $force = false): string
 {
-    $parts = ach_url_guard_history_compact_parts($value, $max);
+    $parts = ach_url_guard_history_compact_parts($value, $max, $force);
     if (!$parts['truncated']) {
         return ach_url_guard_esc($value);
     }
     return '<span class="ach-history-prefix">' . ach_url_guard_esc($parts['head']) . '</span>'
-        . '<span class="ach-history-marker" aria-hidden="true">[...]</span>'
+        . '<span class="ach-history-marker">'
+        . '<span aria-hidden="true">[...]</span>'
+        . '<span class="ach-history-sr-only">middle omitted</span></span>'
         . '<span class="ach-history-suffix">' . ach_url_guard_esc($parts['tail']) . '</span>';
+}
+
+/**
+ * Always retain a measurable exact-value span. The alternate compact label is
+ * exposed only when the original text is wider than the available CSS box.
+ * The input value stays inert and is never fetched or used as a link.
+ */
+function ach_url_guard_history_code(string $value, int $max = 80): string
+{
+    $truncated = ach_url_guard_history_compact_parts($value, $max)['truncated'];
+    $class = 'ach-history-one-line' . ($truncated ? ' ach-history-abbreviated' : '');
+    return '<code class="' . $class . '" dir="ltr" title="' . ach_url_guard_esc($value) . '">'
+        . '<span class="ach-history-original" aria-hidden="' . ($truncated ? 'true' : 'false') . '">'
+        . ach_url_guard_esc($value) . '</span>'
+        . '<span class="ach-history-compact" aria-hidden="' . ($truncated ? 'false' : 'true') . '">'
+        . ach_url_guard_history_compact_html($value, $max, true)
+        . '</span></code>';
+}
+
+/**
+ * Recalculate when the actual code box or font metrics change. In contrast to
+ * a fixed PHP length limit, this catches a 70-character or Unicode URL that
+ * fits desktop but overflows a narrow mobile viewport.
+ */
+function ach_url_guard_history_responsive_script(): void
+{
+    echo <<<'HTML'
+<script>
+(function () {
+    var codes = Array.prototype.slice.call(document.querySelectorAll('.ach-history-one-line'));
+    if (!codes.length) return;
+    var segmenter = typeof Intl !== 'undefined' && Intl.Segmenter
+        ? new Intl.Segmenter(undefined, {granularity: 'grapheme'}) : null;
+    function characters(value) {
+        // Preserve emoji sequences and combining marks when available.
+        return segmenter ? Array.from(segmenter.segment(value), function (item) {
+            return item.segment;
+        }) : Array.from(value);
+    }
+    function update(code) {
+        var original = code.querySelector('.ach-history-original');
+        var compact = code.querySelector('.ach-history-compact');
+        if (!original || !compact) return;
+        var overflow = original.getBoundingClientRect().width > code.clientWidth + 1;
+        code.classList.toggle('ach-history-abbreviated', overflow);
+        original.setAttribute('aria-hidden', overflow ? 'true' : 'false');
+        compact.setAttribute('aria-hidden', overflow ? 'false' : 'true');
+        if (!overflow) return;
+
+        var prefix = compact.querySelector('.ach-history-prefix');
+        var suffix = compact.querySelector('.ach-history-suffix');
+        var marker = compact.querySelector('.ach-history-marker');
+        if (!prefix || !suffix || !marker) return;
+
+        var parts = characters(original.textContent);
+        if (parts.length < 3) return;
+        var measure = document.createElement('span');
+        measure.style.cssText = 'position:absolute;visibility:hidden;white-space:nowrap;width:max-content';
+        measure.setAttribute('aria-hidden', 'true');
+        code.appendChild(measure);
+
+        // Reserve space for a real visible first grapheme and the [...] marker.
+        measure.textContent = parts[0];
+        var prefixWidth = measure.getBoundingClientRect().width;
+        var budget = Math.max(0, code.clientWidth
+            - marker.getBoundingClientRect().width - prefixWidth - 1);
+        var tailCount = Math.min(10, parts.length - 2);
+        do {
+            measure.textContent = parts.slice(-tailCount).join('');
+            if (measure.getBoundingClientRect().width <= budget || tailCount === 1) break;
+            tailCount--;
+        } while (tailCount > 1);
+        measure.remove();
+
+        prefix.textContent = parts.slice(0, parts.length - tailCount - 1).join('');
+        suffix.textContent = parts.slice(-tailCount).join('');
+    }
+    var observer = typeof ResizeObserver === 'function'
+        ? new ResizeObserver(function (entries) {
+            entries.forEach(function (entry) {
+                var code = entry.target.classList.contains('ach-history-original')
+                    ? entry.target.parentElement : entry.target;
+                update(code);
+            });
+        }) : null;
+    codes.forEach(function (code) {
+        update(code);
+        if (observer) {
+            observer.observe(code);
+            observer.observe(code.querySelector('.ach-history-original'));
+        }
+    });
+    if (!observer) {
+        window.addEventListener('resize', function () {
+            codes.forEach(update);
+        });
+    }
+    if (document.fonts && document.fonts.ready) {
+        document.fonts.ready.then(function () { codes.forEach(update); });
+    }
+})();
+</script>
+HTML;
 }
 
 /**
@@ -94,8 +200,7 @@ function ach_url_guard_history_url_field(string $label, string $value): void
 {
     echo '<div class="ach-history-url-field">';
     echo '<strong>' . ach_url_guard_esc($label) . '</strong>';
-    echo '<code class="ach-history-one-line" dir="ltr" title="' . ach_url_guard_esc($value)
-        . '">' . ach_url_guard_history_compact_html($value) . '</code>';
+    echo ach_url_guard_history_code($value);
     echo '<button type="button" class="button ach-history-copy" data-copy-url="'
         . ach_url_guard_esc($value) . '" aria-label="Copy ' . ach_url_guard_esc($label)
         . '">Copy</button></div>';
@@ -156,10 +261,7 @@ function ach_url_guard_history_confirmation(
 ): void {
     echo '<section class="ach-history-confirm" aria-label="Review link deletion">';
     echo '<h3>Review before permanent deletion</h3>';
-    echo '<p>Short keyword: <code class="ach-history-one-line" dir="ltr" title="'
-        . ach_url_guard_esc((string) $row['keyword']) . '">'
-        . ach_url_guard_history_compact_html((string) $row['keyword'], 66)
-        . '</code></p>';
+    echo '<p>Short keyword: ' . ach_url_guard_history_code((string) $row['keyword'], 66) . '</p>';
     ach_url_guard_history_url_field('Full short URL', yourls_link((string) $row['keyword']));
     ach_url_guard_history_url_field('Full destination URL', (string) $row['url']);
     echo '<p id="ach-history-copy-status" role="status" aria-live="polite"></p>';
@@ -265,15 +367,18 @@ function ach_url_guard_history_page(): void
 <style>
 .ach-history-confirm { box-sizing:border-box;max-width:100%;overflow:hidden;border:1px solid #ccc;padding:1em;margin:1em 0; }
 .ach-history-url-field { display:grid;grid-template-columns:9rem minmax(0,1fr) auto;align-items:center;gap:.5em 1em;margin:.6em 0;min-width:0; }
-.ach-history-one-line { display:inline-flex;box-sizing:border-box;max-width:100%;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;unicode-bidi:isolate; }
-.ach-history-prefix { flex:0 1 auto;min-width:0;overflow:hidden;white-space:nowrap; }
+.ach-history-one-line { position:relative;display:inline-flex;box-sizing:border-box;width:100%;max-width:100%;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;unicode-bidi:isolate; }
+.ach-history-original { flex:0 0 auto;white-space:nowrap; }
+.ach-history-compact { display:none;min-width:0;width:100%; }
+.ach-history-abbreviated .ach-history-original { position:absolute;visibility:hidden;width:max-content;max-width:none; }
+.ach-history-abbreviated .ach-history-compact { display:inline-flex; }
+.ach-history-prefix { flex:1 1 auto;min-width:0;overflow:hidden;white-space:nowrap; }
 .ach-history-marker,.ach-history-suffix { flex:0 0 auto;white-space:nowrap; }
-.ach-history-url-field .ach-history-one-line { display:flex; }
+.ach-history-sr-only { position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap; }
 .ach-history-copy { white-space:nowrap; }
 .ach-history-table { width:100%;min-width:760px;table-layout:fixed; }
 .ach-history-table th,.ach-history-table td { vertical-align:top; }
 .ach-history-keyword { min-width:0;overflow:hidden; }
-.ach-history-keyword .ach-history-one-line { display:flex;width:100%; }
 @media (max-width:650px) {
     .ach-history-url-field { grid-template-columns:minmax(0,1fr) auto; }
     .ach-history-url-field strong { grid-column:1 / -1; }
@@ -341,10 +446,9 @@ HTML;
         foreach ($page['rows'] as $row) {
             $verdict = HistoricalReview::inspect($row, $settings);
             $flagged = $verdict['status'] === 'deny';
-            echo '<tr><td><input type="checkbox" class="ach-history-select"' . ' name="bulk_keywords[]" form="ach-bulk-create" value="' . ach_url_guard_esc((string) $row['keyword']) . '" aria-label="Select ' . ach_url_guard_esc((string) $row['keyword']) . '" />' . '</td><td class="ach-history-keyword"><code class="ach-history-one-line" dir="ltr" title="'
-                . ach_url_guard_esc((string) $row['keyword']) . '">'
-                . ach_url_guard_history_compact_html((string) $row['keyword'], 46)
-                . '</code></td>';
+            echo '<tr><td><input type="checkbox" class="ach-history-select"' . ' name="bulk_keywords[]" form="ach-bulk-create" value="' . ach_url_guard_esc((string) $row['keyword']) . '" aria-label="Select ' . ach_url_guard_esc((string) $row['keyword']) . '" />'
+                . '</td><td class="ach-history-keyword">'
+                . ach_url_guard_history_code((string) $row['keyword'], 46) . '</td>';
             echo '<td>' . ach_url_guard_esc(HistoricalReview::hostLabel((string) $row['url'])) . '</td>';
             echo '<td>' . ach_url_guard_esc(ach_url_guard_history_reason_label((string) $verdict['reason']));
             if ($flagged) {
@@ -373,5 +477,6 @@ HTML;
             ) . '">Next batch</a></p>';
         }
     }
+    ach_url_guard_history_responsive_script();
     echo '</main>';
 }

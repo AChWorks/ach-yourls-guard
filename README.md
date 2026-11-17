@@ -104,7 +104,7 @@ Execution works in bounded batches while the browser is open, with progress and 
 
 Use a tested backup and specific Production permission before permanent deletion. Native YOURLS delete hooks may have external effects not reversible by a database rollback. The job report does not store a full destination-URL export.
 
-The review **table** shows only destination hostnames, not URL paths, embedded credentials or query values. After the authenticated admin explicitly selects **Review deletion** for one exact link, its confirmation shows both the full short URL and the full original destination URL (which may contain private tokens). The display stays on one line and abbreviates long strings with `[...]`; Copy preserves the full address. URLs are displayed as inert text, never automatically opened, and are not written to logs or bulk job records. Avoid sharing screenshots of a confirmation containing sensitive destinations.
+The review **table** shows only destination hostnames, not URL paths, embedded credentials or query values. After the authenticated admin explicitly selects **Review deletion** for one exact link, its confirmation shows both the full short URL and the full original destination URL (which may contain private tokens). The display measures the available rendered width: values that fit stay intact, while overflowing values stay on one line with a visible middle `[...]` and an exact trailing suffix (also for Unicode); Copy preserves the full address. URLs are displayed as inert text, never automatically opened, and are not written to logs or bulk job records. Avoid sharing screenshots of a confirmation containing sensitive destinations.
 
 ## Inspect old links (read-only CLI)
 
@@ -133,6 +133,12 @@ YOURLS_SOURCE=/path/to/YOURLS-1.10.6 FORCE_LOWERCASE_SOURCE=/path/to/force-lower
 ```
 
 Coverage includes the default anti-chaining domain rules, custom alias cap in Monitor/Enforce and 0-disable behavior, local URL terms/Regex and reserved aliases, invalid admin-rule rejection and real HTTP API status checks, as well as root-only URLs, exact/wildcard rules, private/reserved addresses, numeric aliases, dangerous redirect targets, GET-only redirect validation, HTTP error handling, Google Web Risk and DNSBL mocks, unknown handling, and the YOURLS shunt/monitor/enforce contract. Network calls are mocked in the test harness, so no outside URLs are fetched. The cURL transport tests explicitly verify that failed option configuration never executes a network request and that DNS pinning, TLS and proxy restrictions are selected. The hook contract uses the actual upstream YOURLS filter implementation, without an active database. Additional historical review regressions verify paginated previews, non-secret HTML, stale-record/rule protection, nonce and confirmation handling, and deliberate fixture-only native deletion. The separate database/HTTP integration test installs actual YOURLS 1.10.6 into a disposable MariaDB instance and isolated site, loads Random ShortURLs, Allow Hyphens, Force Lowercase and ACh URL Guard, verifies monitoring/enforcement, authenticated HTTP API allow/deny and HTTP status, existing/new redirect targets, protected admin settings, and compares a full database snapshot before/after the read-only historical audit. It never fetches an external test URL or points at Production.
+
+The responsive Historical Review renderer also has a synthetic browser fixture
+`tests/history-layout-fixture.php` and an isolated Playwright regression
+`tests/history-layout-browser.mjs` covering one-line shortening and exact-value
+copying at nine viewport widths. These tests use no live YOURLS URLs and are
+not part of the PHP-only CI jobs.
 
 The integration additionally proves repeated rejected checks are coalesced and other expensive requests are deferred across separate PHP processes with the **actual native YOURLS 15-second flood delay**; it verifies no YOURLS database mutations from this admission state.
 

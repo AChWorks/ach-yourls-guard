@@ -176,6 +176,30 @@ $mobileParts = ach_url_guard_history_compact_parts(str_repeat('z', 500), 80);
 check($mobileParts['truncated'] && strlen($mobileParts['tail']) <= 10
     && strlen($mobileParts['head']) > 0,
     'narrow mobile value keeps a compact exact suffix and visible start');
+$mediumValue = 'https://example.org/' . str_repeat('abcde', 10);
+$mediumCode = ach_url_guard_history_code($mediumValue, 80);
+check(strlen($mediumValue) < 80
+    && str_contains($mediumCode, 'class="ach-history-one-line"')
+    && str_contains($mediumCode, 'class="ach-history-compact" aria-hidden="true"')
+    && str_contains($mediumCode, 'class="ach-history-marker"'),
+    'medium-length value has a hidden compact alternative for width-dependent overflow');
+$unicodeValue = 'https://example.org/' . str_repeat('路径', 10);
+$unicodeCode = ach_url_guard_history_code($unicodeValue);
+check(str_contains($unicodeCode, 'ach-history-original')
+    && str_contains($unicodeCode, 'ach-history-compact')
+    && str_contains($unicodeCode, 'middle omitted'),
+    'Unicode text has both original and accessible abbreviated alternatives');
+ob_start();
+ach_url_guard_history_responsive_script();
+$responsiveScript = ob_get_clean();
+check(str_contains($responsiveScript, 'getBoundingClientRect().width > code.clientWidth')
+    && str_contains($responsiveScript, 'ResizeObserver')
+    && str_contains($responsiveScript, 'Intl.Segmenter'),
+    'rendered-width and grapheme-aware abbreviation is initialized with resize observation');
+check(str_contains($responsiveScript, 'original.setAttribute')
+    && str_contains($responsiveScript, 'compact.setAttribute')
+    && str_contains($responsiveScript, 'suffix.textContent'),
+    'accessible compact state and exact untrusted suffix use safe text assignment');
 check(ach_url_guard_history_compact('https://example.org/') === 'https://example.org/',
     'short URL remains unchanged in display');
 check(str_contains(ach_url_guard_history_compact(str_repeat('مسیر', 40), 22), '[...]'),
@@ -199,6 +223,11 @@ $_GET = [];
 $_POST = [];
 ob_start();ach_url_guard_history_page();$html = ob_get_clean();
 check(str_contains($html, 'Review deletion'), 'definitely flagged rows provide review');
+check(str_contains($html, 'ach-history-original')
+    && str_contains($html, 'ach-history-compact')
+    && str_contains($html, 'getBoundingClientRect().width > code.clientWidth'),
+    'normal admin page includes responsive abbreviation markup and working resize script');
+
 check(str_contains($html, 'ach-history-table') && str_contains($html, 'white-space:nowrap')
     && str_contains($html, 'text-overflow:ellipsis'),
     'list retains single-line compact values and bounded responsive columns');
