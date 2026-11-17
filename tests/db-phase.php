@@ -6,7 +6,7 @@ declare(strict_types=1);
  * database and an isolated YOURLS source copy. Never point this at production.
  */
 $phase = $argv[1] ?? '';
-if (!in_array($phase, ['ping', 'create', 'install', 'verify', 'snapshot', 'drop', 'gate'], true)) {
+if (!in_array($phase, ['ping', 'create', 'install', 'verify', 'snapshot', 'drop', 'gate', 'background-seed', 'background-ready', 'background-approve', 'background-done'], true)) {
     fwrite(STDERR, "Expected ping|create|install|verify|snapshot|drop.\n");
     exit(2);
 }
@@ -86,6 +86,73 @@ $expect(count($active) === 4, 'All four plugins must remain active.');
 $expect(function_exists('ozh_random_shorturl'), 'Random ShortURLs loaded.');
 $expect(function_exists('ozh_hyphen_in_charset'), 'Allow Hyphens loaded.');
 $expect(function_exists('ozh_break_the_web_lowercase'), 'Force Lowercase loaded.');
+
+// Full CLI background worker contract: seed/inspect/authorize in distinct
+// processes, with real native YOURLS/MariaDB tables and no external URL fetch.
+// The shell wrapper separately invokes bin/bulk-worker.php between these phases.
+if (str_starts_with($phase, 'background-')) {
+    $bulk = yourls_get_db('write-ach_guard_background_fixture');
+    $keyword = 'bg-worker-mysql';
+    if ($phase === 'background-seed') {
+        $expect(yourls_insert_link_in_db('https://bad.example/bg-worker-path?private=NEVER_EXPOSE',
+            $keyword, 'Isolated worker-only fixture'), 'Must create disposable row directly.');
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::create($bulk, 'integration', 'page',
+            \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason'=>'blocked_domain']),
+            [$keyword]);
+        $expect($job['phase'] === 'scan', 'CLI test must start with unconfirmed scan');
+        echo $job['id'], "\n";
+        exit(0);
+    }
+    $jobID = getenv('ACH_IT_BG_JOB_ID') ?: '';
+    $expect((bool) preg_match('/^[0-9a-f]{24}$/D', $jobID), 'Expected unique CLI fixture job ID');
+    $job = \ACh\Yourls\UrlGuard\BulkHistory::load($bulk, $jobID, 'integration');
+    $expect($job !== null, 'Saved job must survive worker process restart');
+    if ($phase === 'background-ready') {
+        $expect($job['phase'] === 'ready' && $job['scanned'] === 1 && $job['matched'] === 1
+            && $job['deleted'] === 0, 'External CLI worker must dry-run, not delete');
+        $expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($bulk, $keyword) !== null,
+            'No user-visible link can be deleted before approval');
+        echo "PASS CLI background preview persisted ready state with zero deletions.\n";
+        // The AJAX callback must be authenticated and read-only. Its HTML
+        // includes the final gated DELETE form only after ready, not sooner.
+        yourls_set_user('integration');
+        yourls_add_filter('shunt_is_valid_user', static fn() => true);
+        $_SERVER['REQUEST_METHOD'] = 'GET';
+        $_GET = ['job' => $jobID];
+        ob_start();
+        ach_url_guard_bulk_ajax_status();
+        $json = ob_get_clean();
+        $_GET = [];
+        $status = json_decode($json, true);
+        $expect(is_array($status) && ($status['ok'] ?? null) === true
+            && ($status['phase'] ?? '') === 'ready'
+            && ($status['deleted'] ?? -1) === 0
+            && str_contains((string) ($status['html'] ?? ''), 'DELETE 1')
+            && str_contains((string) ($status['html'] ?? ''), 'Start confirmed background deletion'),
+            'Authenticated admin AJAX status returns ready form without writing');
+        $again = \ACh\Yourls\UrlGuard\BulkHistory::load($bulk, $jobID, 'integration');
+        $expect($again['phase'] === 'ready' && $again['deleted'] === 0,
+            'Status callback must not advance preview or authorize deletion');
+    } elseif ($phase === 'background-approve') {
+        $bad = false;
+        try { \ACh\Yourls\UrlGuard\BulkHistory::startDeletion($bulk, $jobID,
+            'integration', 'DELETE 2', true); } catch (InvalidArgumentException $e) { $bad = true; }
+        $expect($bad, 'Wrong DELETE count must not enqueue background deletion.');
+        $approved = \ACh\Yourls\UrlGuard\BulkHistory::startDeletion(
+            $bulk, $jobID, 'integration', 'DELETE 1', true);
+        $expect($approved['phase'] === 'delete', 'Exact confirmation can queue deletion.');
+        echo "PASS typed authorization enqueued only one fixture deletion.\n";
+    } elseif ($phase === 'background-done') {
+        $expect($job['phase'] === 'done' && $job['deleted'] === 1
+            && $job['processed'] === 1, 'CLI worker must finish one authorized deletion');
+        $expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($bulk, $keyword) === null,
+            'Only the approved test row is removed.');
+        $expect((string) $pdo->query("SELECT url FROM yourls_url WHERE keyword='yourlsblog'")->fetchColumn()
+            === 'https://blog.yourls.org/', 'Existing original redirect preserved after CLI worker');
+        echo "PASS CLI background deletion: exact approved fixture removed; legacy links unchanged.\n";
+    }
+    exit(0);
+}
 
 // This phase runs as three independent CLI processes against one disposable
 // YOURLS database. Native flood delay is enabled only for this focused probe.

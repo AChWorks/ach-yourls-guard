@@ -147,6 +147,7 @@ final class BulkHistory
             'ceiling' => (string) ($high['keyword'] ?? ''), 'cursor' => '',
             'scanned' => 0, 'matched' => 0, 'processed' => 0,
             'deleted' => 0, 'skipped' => 0, 'reason_counts' => [],
+            'updated_at' => gmdate('c'), 'error_class' => '',
         ];
         $n = $db->fetchAffected('INSERT INTO ' . self::optionsTable()
             . ' (option_name, option_value) VALUES (:name, :value)',
@@ -170,6 +171,7 @@ final class BulkHistory
 
     private static function save($db, array $job): void
     {
+        $job['updated_at'] = gmdate('c');
         $n = $db->fetchAffected('UPDATE ' . self::optionsTable()
             . ' SET option_value = :value WHERE option_name = :name',
             ['value' => serialize($job), 'name' => self::optionName((string) $job['id'])]);
@@ -199,6 +201,82 @@ final class BulkHistory
             ];
         }
         return $jobs;
+    }
+
+    /**
+     * Enumerate previously approved active jobs for an authenticated host-local
+     * worker. Only the admin request handler can create a scan or authorize
+     * the phase transition to deletion; this listing never performs either.
+     */
+    public static function runnableJobs($db): array
+    {
+        $rows = $db->fetchAll('SELECT option_name, option_value FROM ' . self::optionsTable()
+            . ' WHERE option_name LIKE :prefix ORDER BY option_id ASC',
+            ['prefix' => self::OPTION_PREFIX . '%']);
+        $active = [];
+        foreach ($rows as $row) {
+            $name = (string) ($row['option_name'] ?? '');
+            $id = substr($name, strlen(self::OPTION_PREFIX));
+            if (!str_starts_with($name, self::OPTION_PREFIX)
+                || !preg_match('/^[0-9a-f]{24}$/D', $id)) {
+                continue;
+            }
+            $job = yourls_maybe_unserialize((string) ($row['option_value'] ?? ''));
+            if (!is_array($job) || ($job['id'] ?? '') !== $id
+                || !is_string($job['owner'] ?? null) || $job['owner'] === ''
+                || !in_array($job['phase'] ?? null, ['scan', 'delete'], true)) {
+                continue;
+            }
+            $active[] = ['id' => $id, 'owner' => $job['owner'], 'phase' => $job['phase']];
+        }
+        return $active;
+    }
+
+    /** Stop a failed worker job for an explicit admin retry; never retry a
+     * destructive batch indefinitely or expose raw exception messages. */
+    public static function fail($db, string $id, string $owner, string $errorClass): array
+    {
+        $db->beginTransaction();
+        try {
+            $job = self::load($db, $id, $owner, true);
+            if ($job === null) throw new \RuntimeException('Job unavailable');
+            if (in_array($job['phase'], ['scan', 'delete'], true)) {
+                $job['retry_phase'] = $job['phase'];
+                $job['phase'] = 'error';
+                $job['error_class'] = preg_replace('/[^A-Za-z0-9_]/', '', str_replace('\\', '_', $errorClass));
+                self::save($db, $job);
+            }
+            $db->commit();
+            return $job;
+        } catch (\Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+    }
+
+    /** Retry preserves cursor and snapshot; changing policy never unpauses a
+     * stale job, particularly after deletion authorization. */
+    public static function retry($db, string $id, string $owner): array
+    {
+        $db->beginTransaction();
+        try {
+            $job = self::load($db, $id, $owner, true);
+            if ($job === null || $job['phase'] !== 'error'
+                || !in_array($job['retry_phase'] ?? null, ['scan', 'delete'], true)) {
+                throw new \InvalidArgumentException('Only failed jobs can be retried');
+            }
+            $settings = HistoricalReview::storedSettings($db, true);
+            $job['phase'] = hash_equals((string) $job['policy_hash'], self::policyHash($settings))
+                ? $job['retry_phase'] : 'paused';
+            unset($job['retry_phase']);
+            $job['error_class'] = '';
+            self::save($db, $job);
+            $db->commit();
+            return $job;
+        } catch (\Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
     }
 
     /** Bounded keyset scan; never serializes an unbounded keyword list. */
@@ -464,7 +542,7 @@ final class BulkHistory
         try {
             $job = self::load($db, $id, $owner, true);
             if ($job === null) throw new \RuntimeException('Review job unavailable');
-            if (in_array($job['phase'], ['scan', 'ready', 'delete'], true)) {
+            if (in_array($job['phase'], ['scan', 'ready', 'delete', 'error'], true)) {
                 $job['phase'] = 'cancelled';
                 self::save($db, $job);
             }

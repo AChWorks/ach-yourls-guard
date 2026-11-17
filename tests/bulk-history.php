@@ -12,7 +12,9 @@ require dirname(__DIR__) . '/src/Guard.php';
 require dirname(__DIR__) . '/src/Reputation.php';
 require dirname(__DIR__) . '/src/HistoricalReview.php';
 require dirname(__DIR__) . '/src/BulkHistory.php';
+require dirname(__DIR__) . '/src/HistoryWorker.php';
 use ACh\Yourls\UrlGuard\BulkHistory;
+use ACh\Yourls\UrlGuard\HistoryWorker;
 use ACh\Yourls\UrlGuard\HistoricalReview;
 
 final class BulkSqlite
@@ -330,5 +332,72 @@ assertBulk($job['phase'] === 'ready' && $job['matched'] === 0
     'unknown DNS outcome never enters destructive candidate snapshot');
 BulkHistory::cancel($db, $job['id'], 'fixture-admin');
 BulkHistory::clear($db, $job['id'], 'fixture-admin');
+
+
+// Background worker: dry-run cannot self-authorize deletion. No browser
+// requests, HTTP side effects or external service calls are required.
+$db->fetchAffected('INSERT INTO yourls_url(keyword,url,title,timestamp,clicks)'
+    . ' VALUES (:key,:url,:title,:time,0)', [
+    'key' => 'worker-reviewed', 'url' => 'https://bit.ly/worker-target?secret=NEVER_EXPOSE_WORKER',
+    'title' => 'worker fixture', 'time' => '2026-11-12 10:00:00',
+]);
+$background = BulkHistory::create($db, 'fixture-admin', 'page',
+    BulkHistory::filter(['reason' => 'blocked_domain']), ['worker-reviewed']);
+assertBulk(count(BulkHistory::runnableJobs($db)) === 1, 'only unconfirmed scan is runnable');
+$run = HistoryWorker::run($db, 1);
+$ready = BulkHistory::load($db, $background['id'], 'fixture-admin');
+assertBulk($run['steps'] >= 1 && $run['failures'] === 0,
+    'headless worker completes a saved preview with no client/browser');
+assertBulk($ready['phase'] === 'ready' && $ready['matched'] === 1
+    && $ready['deleted'] === 0 && HistoricalReview::find($db, 'worker-reviewed') !== null,
+    'scan stops at ready; no background deletion before explicit approval');
+assertBulk(BulkHistory::runnableJobs($db) === [], 'ready job never enters background deletion');
+$run = HistoryWorker::run($db, 1);
+assertBulk($run['steps'] === 0 && HistoricalReview::find($db, 'worker-reviewed') !== null,
+    'idle worker cannot delete unconfirmed candidate');
+$badApproval = false;
+try {
+    BulkHistory::startDeletion($db, $background['id'], 'fixture-admin', 'DELETE 999', true);
+} catch (InvalidArgumentException $error) {
+    $badApproval = true;
+}
+assertBulk($badApproval && BulkHistory::runnableJobs($db) === [],
+    'wrong typed confirmation does not enqueue deletion');
+$delete = BulkHistory::startDeletion($db, $background['id'], 'fixture-admin', 'DELETE 1', true);
+assertBulk($delete['phase'] === 'delete', 'exact approval transitions a ready snapshot into delete');
+$run = HistoryWorker::run($db, 1);
+$done = BulkHistory::load($db, $background['id'], 'fixture-admin');
+assertBulk($run['steps'] >= 1 && $done['phase'] === 'done'
+    && $done['deleted'] === 1 && HistoricalReview::find($db, 'worker-reviewed') === null,
+    'approved worker deletes only its verified fixture candidate and terminates');
+BulkHistory::clear($db, $background['id'], 'fixture-admin');
+
+// Fail-closed worker errors require an owner action, and cannot bypass policy
+// changes or restart an abandoned deletion confirmation.
+$failure = BulkHistory::create($db, 'fixture-admin', 'page',
+    BulkHistory::filter(['reason' => 'blocked_domain']), ['l0000']);
+$failed = BulkHistory::fail($db, $failure['id'], 'fixture-admin', 'PDOException');
+assertBulk($failed['phase'] === 'error' && $failed['retry_phase'] === 'scan'
+    && $failed['error_class'] === 'PDOException',
+    'unexpected worker exception recorded without raw SQL, URL, or secret');
+assertBulk(BulkHistory::runnableJobs($db) === [], 'failed job never silently retries');
+$retry = BulkHistory::retry($db, $failure['id'], 'fixture-admin');
+assertBulk($retry['phase'] === 'scan' && $retry['error_class'] === ''
+    && count(BulkHistory::runnableJobs($db)) === 1,
+    'authenticated retry resumes exact cursor and same policy');
+$cancel = BulkHistory::cancel($db, $failure['id'], 'fixture-admin');
+assertBulk($cancel['phase'] === 'cancelled' && BulkHistory::runnableJobs($db) === [],
+    'cancel removes worker eligibility without changing URL records');
+BulkHistory::clear($db, $failure['id'], 'fixture-admin');
+$policyFailure = BulkHistory::create($db, 'fixture-admin', 'page',
+    BulkHistory::filter(['reason' => 'blocked_domain']), ['l0000']);
+BulkHistory::fail($db, $policyFailure['id'], 'fixture-admin', 'RuntimeException');
+$db->fetchAffected('UPDATE yourls_options SET option_value=:v WHERE option_name=:k',
+    ['k' => 'ach_url_guard_settings', 'v' => serialize(['mode' => 'monitor'])]);
+$paused = BulkHistory::retry($db, $policyFailure['id'], 'fixture-admin');
+assertBulk($paused['phase'] === 'paused' && BulkHistory::runnableJobs($db) === [],
+    'changed policy blocks retry and requires a new dry-run');
+BulkHistory::clear($db, $policyFailure['id'], 'fixture-admin');
+assertBulk($checks > 65, 'background job assertions ran');
 
 echo 'PASS '.$checks.' bulk selection/filter/snapshot/chunk/cancel/network-state assertions in disposable SQLite'.PHP_EOL;

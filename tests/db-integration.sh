@@ -104,6 +104,7 @@ cp "$upstream/sample-public-front-page.txt" "$ACH_IT_SITE/index.php"
 mkdir -p "$ACH_IT_SITE/user/plugins/force-lowercase" "$ACH_IT_SITE/user/plugins/ach-url-guard"
 cp "$force/plugin.php" "$ACH_IT_SITE/user/plugins/force-lowercase/plugin.php"
 cp "$repo/plugin.php" "$ACH_IT_SITE/user/plugins/ach-url-guard/plugin.php"
+cp -R "$repo/bin" "$ACH_IT_SITE/user/plugins/ach-url-guard/bin"
 cp -R "$repo/src" "$ACH_IT_SITE/user/plugins/ach-url-guard/src"
 cat >"$ACH_IT_SITE/user/config.php" <<'CONFIG'
 <?php
@@ -127,6 +128,16 @@ run_php "$repo/tests/db-phase.php" create
 database_created=1
 run_php "$repo/tests/db-phase.php" install
 run_php "$repo/tests/db-phase.php" verify
+
+# Exercise a real background cron-style PHP process in the disposable site.
+# Preview must stop at ready until a separate authorization is recorded.
+export ACH_IT_BG_JOB_ID="$(run_php "$repo/tests/db-phase.php" background-seed)"
+run_php "$ACH_IT_SITE/user/plugins/ach-url-guard/bin/bulk-worker.php" --site="$ACH_IT_SITE" --seconds=5
+run_php "$repo/tests/db-phase.php" background-ready
+run_php "$repo/tests/db-phase.php" background-approve
+run_php "$ACH_IT_SITE/user/plugins/ach-url-guard/bin/bulk-worker.php" --site="$ACH_IT_SITE" --seconds=5
+run_php "$repo/tests/db-phase.php" background-done
+unset ACH_IT_BG_JOB_ID
 
 # The opt-in historical audit is required to be read-only, including options/events.
 before="$(run_php "$repo/tests/db-phase.php" snapshot)"

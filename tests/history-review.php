@@ -409,6 +409,42 @@ foreach (['missing-404','missing-410','healthy-200','blocked-403','rate-429','se
     }
 }
 
+
+// In-place UX contract: large scans no longer re-POST the entire admin page.
+// Destructive confirmation is absent until the saved dry-run reaches ready.
+$jobUi = [
+    'id'=>str_repeat('a',24), 'phase'=>'scan', 'mode'=>'all',
+    'scanned'=>21100, 'matched'=>2217, 'processed'=>0,
+    'deleted'=>0, 'skipped'=>0, 'updated_at'=>gmdate('c'),
+    'filter'=>['reason'=>'any','clicks'=>'any','host'=>'','prefix'=>'','before'=>''],
+];
+ob_start();ach_url_guard_bulk_job($jobUi);$scanUI=ob_get_clean();
+check(str_contains($scanUI, 'No short links are deleted during scanning')
+    && str_contains($scanUI, 'Run one scan batch manually')
+    && !str_contains($scanUI, 'bulk_confirm_text')
+    && !str_contains($scanUI, 'Start confirmed background deletion'),
+    'scan state cannot show deletion action before completed preview');
+$jobUi['phase'] = 'ready';
+ob_start();ach_url_guard_bulk_job($jobUi);$readyUI=ob_get_clean();
+check(str_contains($readyUI, 'DELETE 2217')
+    && str_contains($readyUI, 'Start confirmed background deletion')
+    && str_contains($readyUI, 'without individual manual review'),
+    'ready state shows precise typed confirmation and destructive scope');
+ob_start();ach_url_guard_bulk_poll_script($jobUi['id']);$pollJS=ob_get_clean();
+check(str_contains($pollJS, 'admin-ajax.php?action=ach_guard_bulk_status')
+    && str_contains($pollJS, 'fetch(endpoint')
+    && str_contains($pollJS, 'box.innerHTML=d.html')
+    && !str_contains($pollJS, 'location.reload(')
+    && !str_contains($pollJS, 'form.submit('),
+    'live progress polls JSON and updates a card without page reload');
+$jobUi['phase']='error';
+$jobUi['retry_phase']='scan';
+$jobUi['error_class']='PDOException';
+ob_start();ach_url_guard_bulk_job($jobUi);$errorUI=ob_get_clean();
+check(str_contains($errorUI, 'Retry background processing')
+    && str_contains($errorUI, 'No background processing will continue until an admin retries.'),
+    'server worker failure is recoverable with explicit user retry');
+
 check(in_array('ach_url_guard_history_delete', $nonceActions, true), 'delete nonce checked');
 
 $_POST = []; $_GET = []; $_SERVER['REQUEST_METHOD'] = 'GET';

@@ -45,6 +45,8 @@ function ach_url_guard_bulk_request($db): array
                     $job = BulkHistory::startDeletion($db, $id, $owner,
                         ach_url_guard_bulk_post('bulk_confirm_text'),
                         ach_url_guard_bulk_post('bulk_confirm') === '1');
+                } elseif ($action === 'retry') {
+                    $job = BulkHistory::retry($db, $id, $owner);
                 } elseif ($action === 'cancel') {
                     $job = BulkHistory::cancel($db, $id, $owner);
                 } elseif ($action === 'clear') {
@@ -79,11 +81,22 @@ function ach_url_guard_bulk_job(array $job): void
     $phase = (string) $job['phase'];
     $id = (string) $job['id'];
     echo '<section aria-label="Historical bulk review progress" style="border:1px solid #ccc;padding:1em;margin:1em 0;">';
-    echo '<h3>Filtered selection job</h3>';
-    echo '<p>Progress: <strong>' . ach_url_guard_esc($phase) . '</strong> — '
-        . (int) $job['scanned'] . ' scanned, ' . (int) $job['matched']
-        . ' exactly snapshotted candidates; ' . (int) $job['processed'] . ' processed, '
-        . (int) $job['deleted'] . ' deleted, ' . (int) $job['skipped'] . ' skipped.</p>';
+    echo '<h3>Bulk review job</h3>';
+    $states = [
+        'scan' => 'Scanning — read-only preview',
+        'ready' => 'Ready — preview complete',
+        'delete' => 'Deleting — explicitly confirmed batch',
+        'done' => 'Completed',
+        'error' => 'Worker error — manual retry required',
+        'paused' => 'Stopped — policy changed',
+        'cancelled' => 'Cancelled',
+    ];
+    echo '<p><strong>Status: ' . ach_url_guard_esc($states[$phase] ?? $phase) . '</strong></p>';
+    echo '<p><strong>' . (int) $job['scanned'] . '</strong> links scanned; '
+        . '<strong>' . (int) $job['matched'] . '</strong> snapshot matches; '
+        . '<strong>' . (int) $job['processed'] . '</strong> processed; '
+        . '<strong>' . (int) $job['deleted'] . '</strong> deleted; '
+        . '<strong>' . (int) $job['skipped'] . '</strong> skipped.</p>';
     echo '<p>Scope: ' . ($job['mode'] === 'all' ? 'All matching rows across all pages'
         : 'Selected keywords from the starting page') . '.</p>';
     $filters = $job['filter'];
@@ -93,34 +106,44 @@ function ach_url_guard_bulk_job(array $job): void
         . '</code>, prefix <code>' . ach_url_guard_esc($filters['prefix'] ?: '(any)')
         . '</code>, created on/before <code>' . ach_url_guard_esc($filters['before'] ?: '(any)')
         . '</code>.</p>';
-    echo '<p><a href="' . ach_url_guard_esc(yourls_admin_url(
-        'plugins.php?page=ach_url_guard_history&bulk_job=' . rawurlencode($id)
-    )) . '">Bookmark this job to resume after closing the browser</a></p>';
+    $bookmark = yourls_admin_url('plugins.php?page=ach_url_guard_history&bulk_job=' . rawurlencode($id));
+    echo '<p><a href="' . ach_url_guard_esc($bookmark)
+        . '">Bookmark / reopen this job at any time</a></p>';
     if (in_array($phase, ['scan', 'delete'], true)) {
-        $label = $phase === 'scan' ? 'Continue scanning' : 'Continue deletion';
-        echo '<p>Work proceeds in bounded batches while this browser is open.'
-            . ' Closing it pauses further requests; progress is saved.</p>';
-        echo '<form method="post" id="ach-bulk-step">';
-        echo ach_url_guard_history_hidden('bulk_action', 'step');
-        echo ach_url_guard_history_hidden('bulk_job', $id);
-        echo ach_url_guard_history_hidden('bulk_nonce', yourls_create_nonce('ach_url_guard_bulk'));
-        echo '<button type="submit" class="button primary">' . $label . '</button></form>';
-        ach_url_guard_bulk_action_form('cancel', $id, 'Cancel job permanently (completed deletions remain)');
-        echo '<button type="button" id="ach-bulk-pause-browser" class="button">Pause automatic continuation</button>';
-        echo '<script>(function(){var form=document.getElementById("ach-bulk-step");'
-            . 'var pause=document.getElementById("ach-bulk-pause-browser");'
-            . 'var t=setTimeout(function(){if(form)form.submit()},600);'
-            . 'if(pause)pause.addEventListener("click",function(){clearTimeout(t);'
-            . 'pause.disabled=true;pause.textContent="Automatic continuation paused";});})();</script>';
+        $last = strtotime((string) ($job['updated_at'] ?? '')) ?: 0;
+        echo '<p>Work is performed by the server background worker, not this browser.'
+            . ' You can navigate away and return using the bookmarked link.'
+            . ' This page updates progress in place, without full-page refresh.</p>';
+        if ($phase === 'scan') {
+            echo '<p><strong>No short links are deleted during scanning.</strong>'
+                . ' The destructive confirmation becomes available only after all rows have been previewed.</p>';
+        } else {
+            echo '<p>Previously confirmed deletion is in progress. Cancel stops subsequent batches,'
+                . ' but cannot restore links already deleted.</p>';
+        }
+        if ($last === 0 || time() - $last > 120) {
+            echo '<p role="status" class="error"><strong>Worker not recently active.</strong>'
+                . ' Have the site operator verify the scheduled CLI worker.'
+                . ' The saved job can be resumed without restarting its scan.</p>';
+        } else {
+            echo '<p role="status">Last saved progress: ' . ach_url_guard_esc(gmdate('Y-m-d H:i:s', $last))
+                . ' UTC. Waiting for the next scheduled worker run.</p>';
+        }
+        $label = $phase === 'scan' ? 'Run one scan batch manually' : 'Run one deletion batch manually';
+        ach_url_guard_bulk_action_form('step', $id, $label);
+        ach_url_guard_bulk_action_form('cancel', $id, 'Cancel job (completed deletions remain)');
     } elseif ($phase === 'ready') {
+        echo '<p><strong>Dry-run complete.</strong>'
+            . ' No links were removed by the preview.'
+            . ' A definite match is not proof that a destination is malicious.</p>';
         if ((int) $job['matched'] === 0) {
             echo '<p>No definite matching candidates were found. No links will be deleted.</p>';
         } else {
-            echo '<p><strong>Dry-run complete.</strong> A current policy match is not proof'
-                . ' of abuse. Your selection contains ' . (int) $job['matched']
-                . ' snapshotted links. Deletion permanently breaks their redirects.'
+            echo '<p>There are <strong>' . (int) $job['matched']
+                . '</strong> exact snapshotted candidates. Permanent deletion breaks those short links.'
                 . ' Rows changed since scanning will be skipped, not replaced by new matches.'
-                . ' Restore requires your independent site backup.</p>';
+                . ' Before proceeding, verify a recoverable full-site/database backup.'
+                . ' This action has <strong>no undo</strong>.</p>';
             echo '<form method="post">';
             echo ach_url_guard_history_hidden('bulk_action', 'approve');
             echo ach_url_guard_history_hidden('bulk_job', $id);
@@ -131,9 +154,16 @@ function ach_url_guard_bulk_job(array $job): void
             echo '<p><label><input name="bulk_confirm" type="checkbox" value="1" required /> '
                 . 'I authorize permanent deletion of every still-valid candidate matching this filter,'
                 . ' without individual manual review.</label></p>';
-            echo '<p><button class="button" type="submit">Start confirmed batch deletion</button></p></form>';
+            echo '<p><button class="button" type="submit">Start confirmed background deletion</button></p></form>';
         }
         ach_url_guard_bulk_action_form('cancel', $id, 'Cancel without deleting');
+    } elseif ($phase === 'error') {
+        echo '<p role="alert">The server worker stopped after an error ('
+            . ach_url_guard_esc($job['error_class'] ?? 'unavailable')
+            . '). No background processing will continue until an admin retries.'
+            . ' Inspect the server log before retrying; the saved cursor remains intact.</p>';
+        ach_url_guard_bulk_action_form('retry', $id, 'Retry background processing');
+        ach_url_guard_bulk_action_form('cancel', $id, 'Cancel job');
     } elseif ($phase === 'paused') {
         echo '<p>Stopped: the Guard policy changed during scanning or deletion.'
             . ' Start a new dry-run with the latest rules. Already deleted links are not restored.</p>';
@@ -148,6 +178,74 @@ function ach_url_guard_bulk_job(array $job): void
         ach_url_guard_bulk_action_form('clear', $id, 'Clear this job report (not short links)');
     }
     echo '</section>';
+}
+
+/**
+ * YOURLS native admin-ajax.php handles cookie authentication in private mode.
+ * Guard repeats its own login gate for public-mode YOURLS installations.
+ * This endpoint is read-only, never steps a job, and never exposes URLs.
+ */
+function ach_url_guard_bulk_ajax_status(): void
+{
+    ach_url_guard_require_admin();
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
+        http_response_code(405);
+        echo json_encode(['ok' => false, 'error' => 'GET required']);
+        return;
+    }
+    $id = $_GET['job'] ?? '';
+    if (!is_string($id) || !preg_match('/^[0-9a-f]{24}$/D', $id)) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'Invalid job identifier']);
+        return;
+    }
+    try {
+        $db = yourls_get_db('read-ach_guard_bulk_ajax');
+        $job = BulkHistory::load($db, $id, BulkHistory::actor());
+        if ($job === null) {
+            http_response_code(404);
+            echo json_encode(['ok' => false, 'error' => 'No accessible job']);
+            return;
+        }
+        ob_start();
+        ach_url_guard_bulk_job($job);
+        $html = ob_get_clean();
+        echo json_encode([
+            'ok' => true, 'id' => $id, 'phase' => $job['phase'],
+            'updated' => (string) ($job['updated_at'] ?? ''),
+            'scanned' => (int) $job['scanned'], 'matched' => (int) $job['matched'],
+            'processed' => (int) $job['processed'], 'deleted' => (int) $job['deleted'],
+            'skipped' => (int) $job['skipped'], 'html' => $html,
+        ], JSON_INVALID_UTF8_SUBSTITUTE);
+    } catch (Throwable $error) {
+        error_log('ACh URL Guard bulk progress failed [' . get_class($error) . ']');
+        http_response_code(503);
+        echo json_encode(['ok' => false, 'error' => 'Progress temporarily unavailable']);
+    }
+}
+
+/** Updates only the job card; never reloads/submits the whole admin page. */
+function ach_url_guard_bulk_poll_script(string $id): void
+{
+    $endpoint = yourls_admin_url('admin-ajax.php?action=ach_guard_bulk_status&job='
+        . rawurlencode($id));
+    echo '<script>(function(){'
+        . 'var box=document.getElementById("ach-bulk-live");if(!box)return;'
+        . 'var endpoint=' . json_encode($endpoint, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_QUOT | JSON_HEX_APOS)
+        . ';var signature="",timer=null,failures=0;'
+        . 'var message=document.getElementById("ach-bulk-poll-message");'
+        . 'function again(){timer=setTimeout(poll,3000)}'
+        . 'function poll(){fetch(endpoint,{credentials:"same-origin",cache:"no-store"})'
+        . '.then(function(r){if(!r.ok)throw new Error("status "+r.status);return r.json()})'
+        . '.then(function(d){if(!d.ok||typeof d.html!=="string")throw new Error("invalid status");'
+        . 'failures=0;if(message)message.textContent="";'
+        . 'var next=[d.phase,d.updated,d.scanned,d.matched,d.processed,d.deleted,d.skipped].join("|");'
+        . 'if(next!==signature&&!box.contains(document.activeElement)){box.innerHTML=d.html;signature=next;}'
+        . 'if(d.phase==="scan"||d.phase==="delete"){again()}})'
+        . '.catch(function(){failures++;if(message)message.textContent='
+        . '"Live progress is unavailable; the server job is saved. Reopen this page to retry.";'
+        . 'if(failures<5)again()})}'
+        . 'poll()})();</script>';
 }
 
 function ach_url_guard_bulk_recent_jobs($db): void
@@ -198,10 +296,10 @@ function ach_url_guard_bulk_filter_form(): void
         . '<label>Keyword prefix: <input type="text" name="bulk_filter[prefix]" /></label> '
         . '<label>Created on or before: <input type="date" name="bulk_filter[before]" /></label></p>';
     echo '<p><label><input type="checkbox" name="bulk_http_ack" value="1" /> '
-        . 'I approve outbound HTTP/DNS checks when selecting HTTP 404/410,'
+        . 'For network filters only: I approve outbound HTTP/DNS checks when selecting HTTP 404/410,'
         . ' Private DNS address, or Invalid redirect.'
         . ' This runs one checked link per request and can be costly/slow for large sets.'
-        . ' DNSBL/Google Web Risk are never used.</label></p>';
+        . ' DNSBL/Google Web Risk are never used. This is not deletion approval.</label></p>';
     echo '<p><button type="submit" class="button primary">Preview selected/filter-matching links (no deletion)</button></p>';
     echo '</form></section>';
 }

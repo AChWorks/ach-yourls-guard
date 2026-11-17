@@ -3,7 +3,7 @@
 Plugin Name: ACh URL Guard
 Plugin URI: https://github.com/AChWorks/ach-yourls-guard
 Description: Safe new-link policy enforcement and an optional admin-only manual review of historical short links.
-Version: 0.2.2
+Version: 0.2.3
 Author: ACh
 */
 
@@ -19,6 +19,7 @@ require_once __DIR__ . '/src/WorkGate.php';
 require_once __DIR__ . '/src/HistoricalReview.php';
 require_once __DIR__ . '/src/HistoryAdmin.php';
 require_once __DIR__ . '/src/BulkHistory.php';
+require_once __DIR__ . '/src/HistoryWorker.php';
 require_once __DIR__ . '/src/HistoryBulkAdmin.php';
 
 use ACh\Yourls\UrlGuard\Policy;
@@ -30,6 +31,7 @@ yourls_add_filter('shunt_add_new_link', 'ach_url_guard_on_create', 10, 4);
 yourls_add_action('plugins_loaded', 'ach_url_guard_register_page');
 yourls_add_action('load-ach_url_guard', 'ach_url_guard_require_admin');
 yourls_add_action('load-ach_url_guard_history', 'ach_url_guard_require_admin');
+yourls_add_action('yourls_ajax_ach_guard_bulk_status', 'ach_url_guard_bulk_ajax_status');
 
 function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
 {

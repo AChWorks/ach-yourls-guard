@@ -59,6 +59,15 @@ if ($phase === 'verify-public') {
         ]);
         $expect($status === 403, 'Public-mode anonymous admin POST must return 403: ' . $url);
     }
+    // Public YOURLS does not protect native admin-ajax.php by itself. Guard
+    // must reject its read-only job status API before returning any metadata.
+    [$status,,$body] = $request('/admin/admin-ajax.php?action=ach_guard_bulk_status&job=123456789012345678901234');
+    $expect($status === 403 && !str_contains($body, 'snapshot matches')
+        && !str_contains($body, '"scanned"'), 'Public-mode anonymous worker status denied by Guard');
+    [$status,,$body] = $request('/admin/admin-ajax.php?action=ach_guard_bulk_status&job=123456789012345678901234',
+        ['unexpected'=>'post']);
+    $expect($status === 403 && !str_contains($body, '"scanned"'),
+        'Public-mode anonymous status POST denied even before method validation');
     // The disposable router routes / to yourls-loader.php; request the native index directly.
     [$status,,$body] = $request('/index.php');
     $expect($status === 200, 'Public shortening homepage still available when admin is protected.');
@@ -151,6 +160,12 @@ $expect(!str_contains($body, 'name="ach_url_guard_save"'), 'Unauthenticated visi
 $expect(!str_contains($body, 'Settings saved.') && !str_contains($body, 'name="ach_url_guard_save"'),
     'Private-mode anonymous settings POST cannot change policy.');
 
+
+[$status,,$anonymousAjax] = $request(
+    '/admin/admin-ajax.php?action=ach_guard_bulk_status&job=123456789012345678901234');
+$expect(!str_contains($anonymousAjax, '"scanned"')
+    && !str_contains($anonymousAjax, 'snapshot matches'),
+    'Private-mode anonymous status cannot read job metadata');
 
 [$httpCode, , $body] = $request('/admin/plugins.php?page=ach_url_guard_history');
 $expect(!str_contains($body, 'Historical Link Review'), 'Unauthenticated visitor cannot access historical review page.');

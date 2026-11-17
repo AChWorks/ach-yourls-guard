@@ -403,7 +403,14 @@ HTML;
     }
 
     if ($bulkError !== '') ach_url_guard_history_message($bulkError);
-    if ($bulkJob !== null) ach_url_guard_bulk_job($bulkJob);
+    if ($bulkJob !== null) {
+        echo '<div id="ach-bulk-live">';
+        ach_url_guard_bulk_job($bulkJob);
+        echo '</div><p role="status" id="ach-bulk-poll-message"></p>';
+        if (in_array($bulkJob['phase'], ['scan', 'delete'], true)) {
+            ach_url_guard_bulk_poll_script((string) $bulkJob['id']);
+        }
+    }
     ach_url_guard_bulk_filter_form();
     ach_url_guard_bulk_recent_jobs($db);
 
