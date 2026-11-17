@@ -58,7 +58,28 @@ redirects and customer data.
   A complete dry-run materializes exact candidate row proofs in an indexed
   plugin table, plus small owner-bound progress records in YOURLS options.
   Require a typed count and checkbox to confirm permanent deletion; support
-  restartable keyset batches, stop, progress and saved resume link.
+  restartable keyset batches, stop, progress and saved resume link. The
+  operator may separately configure a host-local CLI/cron worker for
+  authenticated, explicitly started jobs after a read-only saved-job inventory.
+  Existing v0.2.2 delete-phase jobs represent **previously confirmed**
+  destructive work and will resume upon enabling cron. The host-local
+  inventory identifies every saved job's owning account and exact ID.
+  Authenticated owners can find all their active deletion jobs even
+  beyond the recent list, or open an exact job ID; cross-owner cancellation
+  remains denied. Inspect/cancel unintended jobs from their original
+  accounts first, without erasing snapshots or metadata. A missing or
+  inaccessible owner with an unresolved delete-phase job blocks scheduler
+  activation until legitimate account recovery or a separately authorized
+  audited recovery procedure resolves the job.
+  A legacy scan resumes scanning only, while ready still needs separate
+  exact-delete authorization. Scanning must continue
+  safely when the admin browser closes and the UI must poll read-only state
+  in place rather than full-page self-reloading. Background deletion is
+  allowed **only after** exact typed DELETE N, checkbox and nonce
+  confirmation for a completed frozen dry-run. Worker errors are visible,
+  stop automatic retries and require an authenticated retry; changed policy
+  invalidates a saved snapshot. Running the worker does not automatically
+  create jobs, audit unselected old URLs or authorize deletion.
 - On explicit single-link review by an authenticated admin, show full short and
   destination URLs (which may include private query tokens) as inert text,
   abbreviating based on actual rendered width in one line with `[...]`
@@ -75,8 +96,9 @@ redirects and customer data.
   keyword prefix and host) on the locked URL row in both local/network modes
   without performing HTTP under a row lock. No DNSBL/Google scans merely by
   opening the admin page.
-- No unattended auto-delete, scheduled worker/cron, redirect-time block or
-  unrelated site mutation. Permanent deletion requires an authenticated admin
+- No unattended auto-delete, automatically installed scheduler, redirect-time block or
+  unrelated site mutation. An explicitly configured host worker may process
+  only admin-initiated scans and already-confirmed deletions. Permanent deletion requires an authenticated admin
   and specific approval. One plugin-owned candidate table is created on first
   bulk review without altering YOURLS core tables.
 - Record privacy-preserving, diagnostic, bounded observations without leaking
@@ -89,7 +111,7 @@ redirects and customer data.
   rules are observational until Enforce. Enabling Enforce and denying unknown
   outcomes need explicit owner policy approval after monitoring.
 - Google APIs and external DNSBL requests remain disabled; no vendor
-  signup, new credentials, billing, silent external calls or cron jobs.
+  signup, new credentials, billing, silent external calls or automatically installed cron jobs.
 - No guarantee against future Cloudflare or Google reputation flags.
   Operators remain responsible for handling reports of abuse.
 - Preserve the lrl.li homepage, branding, other plugins, credentials,

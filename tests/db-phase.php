@@ -6,7 +6,11 @@ declare(strict_types=1);
  * database and an isolated YOURLS source copy. Never point this at production.
  */
 $phase = $argv[1] ?? '';
-if (!in_array($phase, ['ping', 'create', 'install', 'verify', 'snapshot', 'drop', 'gate'], true)) {
+if (!in_array($phase, ['ping', 'create', 'install', 'verify', 'snapshot', 'drop', 'gate',
+    'login-nonce', 'background-seed', 'background-ready', 'background-approve', 'background-done',
+    'background-http-seed', 'background-http-check', 'background-legacy-seed',
+    'background-legacy-verify', 'background-lock-seed', 'background-lock-check',
+    'background-recovery-seed', 'background-recovery-discover', 'background-recovery-verify'], true)) {
     fwrite(STDERR, "Expected ping|create|install|verify|snapshot|drop.\n");
     exit(2);
 }
@@ -86,6 +90,306 @@ $expect(count($active) === 4, 'All four plugins must remain active.');
 $expect(function_exists('ozh_random_shorturl'), 'Random ShortURLs loaded.');
 $expect(function_exists('ozh_hyphen_in_charset'), 'Allow Hyphens loaded.');
 $expect(function_exists('ozh_break_the_web_lowercase'), 'Force Lowercase loaded.');
+
+
+// Nonce generation is restricted to a disposable local fixture. The actual
+// login and bulk approval below are independently tested through HTTP.
+if ($phase === 'login-nonce') {
+    echo yourls_create_nonce('admin_login'), "\n";
+    exit(0);
+}
+
+if ($phase === 'background-http-seed') {
+    $label = getenv('ACH_IT_HTTP_LABEL') ?: '';
+    $expect(in_array($label, ['private','public','other','stale-private','stale-public'], true),
+        'Expected one HTTP fixture name');
+    $keyword = 'bg-http-' . $label;
+    $expect(yourls_insert_link_in_db('https://bad.example/fixture-http-' . $label
+        . '?token=NEVER_EXPOSE_HTTP_' . $label, $keyword, 'HTTP approval fixture'),
+        'HTTP fixture direct insertion');
+    $actor = $label === 'other' ? 'other-operator' : 'integration';
+    $bulk = yourls_get_db('write-ach_guard_background_http_seed');
+    $raw = $bulk->fetchOne('SELECT option_value FROM yourls_options WHERE option_name=:n',
+        ['n'=>'ach_url_guard_settings']);
+    $original = (string) $raw['option_value'];
+    if (str_starts_with($label, 'stale-')) {
+        $older = @unserialize($original, ['allowed_classes'=>false]);
+        $expect(is_array($older), 'Original Guard settings available for stale fixture');
+        $older['blocked_url_terms'] = ['outdated-policy-marker'];
+        $bulk->fetchAffected('UPDATE yourls_options SET option_value=:v WHERE option_name=:n',
+            ['v'=>serialize($older), 'n'=>'ach_url_guard_settings']);
+    }
+    try {
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::create($bulk, $actor, 'page',
+            \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason'=>'blocked_domain']), [$keyword]);
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::scanStep($bulk, $job['id'], $actor);
+    } finally {
+        if (str_starts_with($label, 'stale-')) {
+            $bulk->fetchAffected('UPDATE yourls_options SET option_value=:v WHERE option_name=:n',
+                ['v'=>$original, 'n'=>'ach_url_guard_settings']);
+        }
+    }
+    $expect($job['phase'] === 'ready' && $job['matched'] === 1 && $job['deleted'] === 0,
+        'HTTP fixture prepared an immutable, non-destructive ready snapshot.');
+    echo $job['id'], "\n";
+    exit(0);
+}
+
+if ($phase === 'background-http-check') {
+    $bulk = yourls_get_db('read-ach_guard_background_http_check');
+    foreach (['private','public','other','stale-private','stale-public'] as $label) {
+        $id = getenv('ACH_IT_HTTP_' . strtoupper(str_replace('-', '_', $label)) . '_ID') ?: '';
+        $owner = $label === 'other' ? 'other-operator' : 'integration';
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::load($bulk, $id, $owner);
+        $expected = $label === 'other' ? 'ready' : (str_starts_with($label, 'stale-') ? 'paused' : 'delete');
+        $expect($job !== null && $job['phase'] === $expected
+            && $job['deleted'] === 0 && $job['processed'] === 0,
+            'Only fixture admin-authorized HTTP jobs entered delete; none executed.');
+        $expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($bulk, 'bg-http-' . $label) !== null,
+            'HTTP authorization never directly deletes a short URL.');
+    }
+    echo "PASS real HTTP login/nonce/approval workflow left every fixture URL intact.\n";
+    exit(0);
+}
+
+if ($phase === 'background-legacy-seed') {
+    $bulk = yourls_get_db('write-ach_guard_legacy_fixture');
+    foreach (['scan','ready','delete'] as $wanted) {
+        $keyword = 'legacy-' . $wanted;
+        $expect(yourls_insert_link_in_db('https://bad.example/' . $wanted . '?token=SECRET_LEGACY',
+            $keyword, 'Legacy fixture'), 'Direct legacy fixture inserted: ' . $wanted);
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::create($bulk, 'integration', 'page',
+            \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason'=>'blocked_domain']),
+            [$keyword]);
+        if ($wanted !== 'scan') {
+            $job = \ACh\Yourls\UrlGuard\BulkHistory::scanStep($bulk,
+                $job['id'], 'integration');
+        }
+        if ($wanted === 'delete') {
+            $job = \ACh\Yourls\UrlGuard\BulkHistory::startDeletion($bulk,
+                $job['id'], 'integration', 'DELETE 1', true);
+        }
+        $expect($job['phase'] === $wanted, 'Legacy phase prepared: ' . $wanted);
+        // Legacy v0.2.2 format intentionally omitted worker timestamp and
+        // diagnostics; preserve the exact candidate proof and cursor data.
+        unset($job['updated_at'], $job['error_class'], $job['error_info']);
+        $bulk->fetchAffected('UPDATE yourls_options SET option_value=:value WHERE option_name=:name', [
+            'value' => serialize($job), 'name' => 'ach_url_guard_bulk_' . $job['id'],
+        ]);
+    }
+    echo "PASS seeded three legacy-format v0.2.2 phases without deleting URLs.\n";
+    exit(0);
+}
+
+if ($phase === 'background-legacy-verify') {
+    $bulk = yourls_get_db('read-ach_guard_legacy_fixture');
+    $jobs = \ACh\Yourls\UrlGuard\BulkHistory::jobInventory($bulk);
+    foreach (['scan'=>'ready', 'ready'=>'ready', 'delete'=>'done'] as $original=>$final) {
+        // Job identity is independently determined from original selected
+        // keyword: never infer authorization from a phase/count alone.
+        $rows = $bulk->fetchAll('SELECT option_value FROM yourls_options WHERE option_name LIKE :p',
+            ['p'=>'ach_url_guard_bulk_%']);
+        $found = [];
+        foreach ($rows as $row) {
+            $j = @unserialize($row['option_value'], ['allowed_classes'=>false]);
+            if (is_array($j) && ($j['selected'][0] ?? '') === 'legacy-' . $original) $found[] = $j;
+        }
+        $expect(count($found) === 1 && $found[0]['phase'] === $final,
+            'Legacy ' . $original . ' resumes only to its already-authorized state');
+        $expect($found[0]['deleted'] === ($original === 'delete' ? 1 : 0),
+            'No legacy scan/ready job fabricated delete authorization');
+        $row = \ACh\Yourls\UrlGuard\HistoricalReview::find($bulk, 'legacy-' . $original);
+        $expect(($row === null) === ($original === 'delete'),
+            'Legacy ready and scan links survive; explicitly approved delete fixture finishes.');
+    }
+    echo "PASS v0.2.2-format scan/ready/delete interpreted without authorization drift.\n";
+    exit(0);
+}
+
+if ($phase === 'background-lock-seed') {
+    $bulk = yourls_get_db('write-ach_guard_lock_fixture');
+    $keyword='lock-fixture';
+    $expect(yourls_insert_link_in_db('https://bad.example/lock-fixture?token=NO_LOG_LOCK',
+        $keyword, 'Worker overlap fixture'), 'Lock fixture inserted');
+    $job = \ACh\Yourls\UrlGuard\BulkHistory::create($bulk, 'integration', 'page',
+        \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason'=>'blocked_domain']), [$keyword]);
+    $expect($job['phase'] === 'scan', 'Lock fixture starts unconfirmed');
+    echo $job['id'], "\n";
+    exit(0);
+}
+if ($phase === 'background-lock-check') {
+    $id = getenv('ACH_IT_LOCK_JOB_ID') ?: '';
+    $expect((bool) preg_match('/^[0-9a-f]{24}$/D', $id), 'Expected lock fixture job identity');
+    $bulk=yourls_get_db('read-ach_guard_lock_fixture');
+    $job=\ACh\Yourls\UrlGuard\BulkHistory::load($bulk,$id,'integration');
+    $want=getenv('ACH_IT_LOCK_PHASE') ?: '';
+    echo 'LOCK_JOB_OBSERVED phase=' . ($job['phase'] ?? 'missing')
+        . ' expected=' . $want . ' scanned=' . (int) ($job['scanned'] ?? -1)
+        . ' matched=' . (int) ($job['matched'] ?? -1) . "\n";
+    $expect($job !== null && $job['phase'] === $want && $job['deleted'] === 0,
+        'Worker lock tests preserve expected phase; never delete');
+    $expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($bulk,'lock-fixture')!==null,
+        'No lock test may delete fixture URL');
+    echo "PASS shared DB worker lock state: " . $want . ".\n";
+    exit(0);
+}
+
+// N1: multi-owner pre-cron recovery, with a genuine frozen candidate snapshot
+// for each old delete job. All data belongs to this disposable database.
+if ($phase === 'background-recovery-seed') {
+    $bulk = yourls_get_db('write-ach_guard_recovery_seed');
+    $ids = [];
+    foreach ([
+        'integration' => 'recovery-own',
+        'other-operator' => 'recovery-other',
+        'unavailable-owner' => 'recovery-missing',
+    ] as $owner => $keyword) {
+        $expect(yourls_insert_link_in_db(
+            'https://bad.example/recover/' . $keyword . '?token=NO_PROD_CONTENT',
+            $keyword, 'Disposable recovery fixture'), 'Recovery fixture link created.');
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::create($bulk, $owner, 'page',
+            \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason' => 'blocked_domain']),
+            [$keyword]);
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::scanStep($bulk, $job['id'], $owner);
+        $expect($job['phase'] === 'ready' && $job['matched'] === 1,
+            'Recovery fixture dry-run completed without deletion');
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::startDeletion($bulk, $job['id'],
+            $owner, 'DELETE 1', true);
+        $expect($job['phase'] === 'delete' && $job['deleted'] === 0,
+            'Recovery fixture old job explicitly approved but not executed');
+        unset($job['updated_at'], $job['error_class'], $job['error_info']);
+        $bulk->fetchAffected('UPDATE yourls_options SET option_value=:value WHERE option_name=:name', [
+            'value'=>serialize($job), 'name'=>'ach_url_guard_bulk_'.$job['id'],
+        ]);
+        $ids[] = $job['id'];
+    }
+    for ($i=0; $i<37; $i++) {
+        foreach (['integration','other-operator'] as $owner) {
+            \ACh\Yourls\UrlGuard\BulkHistory::create($bulk, $owner, 'all',
+                \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason'=>'blocked_domain']), []);
+        }
+    }
+    echo implode(' ', $ids), "\n";
+    exit(0);
+}
+
+if ($phase === 'background-recovery-discover') {
+    $bulk = yourls_get_db('read-ach_guard_recovery_discover');
+    foreach ([
+        'integration'=>'ACH_IT_RECOVERY_INTEGRATION_ID',
+        'other-operator'=>'ACH_IT_RECOVERY_OTHER_ID',
+        'unavailable-owner'=>'ACH_IT_RECOVERY_MISSING_ID',
+    ] as $owner=>$env) {
+        $id=(string) getenv($env);
+        $expect((bool) preg_match('/^[a-f0-9]{24}$/D', $id), 'Saved fixture ID available');
+        $jobs=\ACh\Yourls\UrlGuard\BulkHistory::recentJobs($bulk,$owner);
+        $expect(in_array($id,array_column($jobs,'id'),true),
+            'Oldest deletion visible in owner-scoped list after >30 newer global rows');
+        foreach ($jobs as $candidate) {
+            $expect($candidate['owner'] === $owner,
+                'Owner-scoped job navigation must not expose cross-owner jobs');
+        }
+        $expect(count($jobs)===($owner==='unavailable-owner' ? 1 : 31),
+            'Each owner sees 30 recent plus every older pending deletion');
+    }
+    echo "PASS disposable multi-owner older-than-30 job discovery and isolation.\n";
+    exit(0);
+}
+
+if ($phase === 'background-recovery-verify') {
+    $bulk=yourls_get_db('read-ach_guard_recovery_verify');
+    foreach ([
+        'integration'=>['ACH_IT_RECOVERY_INTEGRATION_ID','cancelled'],
+        'other-operator'=>['ACH_IT_RECOVERY_OTHER_ID','cancelled'],
+        'unavailable-owner'=>['ACH_IT_RECOVERY_MISSING_ID','delete'],
+    ] as $owner=>[$env,$expectedPhase]) {
+        $id=(string) getenv($env);
+        $job=\ACh\Yourls\UrlGuard\BulkHistory::load($bulk,$id,$owner);
+        $expect($job!==null && $job['phase']===$expectedPhase && $job['deleted']===0,
+            'Only original owners cancel their old jobs, orphan remains blocked');
+        $keyword=match($owner) {
+            'integration'=>'recovery-own',
+            'other-operator'=>'recovery-other',
+            default=>'recovery-missing'
+        };
+        $expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($bulk,$keyword)!==null,
+            'Cancelled and orphan jobs do not delete any URL');
+    }
+    $active=\ACh\Yourls\UrlGuard\BulkHistory::jobInventory($bulk);
+    $deleted=array_values(array_filter($active, static fn(array $job):bool =>
+        $job['phase']==='delete' && $job['owner']==='unavailable-owner'));
+    $expect(count($deleted)===1, 'Unknown owner preapproved deletion remains explicit cron blocker');
+    echo "PASS genuine multi-owner HTTP cancellation, orphan scheduler gate, no URL loss.\n";
+    exit(0);
+}
+
+// Full CLI background worker contract: seed/inspect/authorize in distinct
+// processes, with real native YOURLS/MariaDB tables and no external URL fetch.
+// The shell wrapper separately invokes bin/bulk-worker.php between these phases.
+if (str_starts_with($phase, 'background-')) {
+    $bulk = yourls_get_db('write-ach_guard_background_fixture');
+    $keyword = 'bg-worker-mysql';
+    if ($phase === 'background-seed') {
+        $expect(yourls_insert_link_in_db('https://bad.example/bg-worker-path?private=NEVER_EXPOSE',
+            $keyword, 'Isolated worker-only fixture'), 'Must create disposable row directly.');
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::create($bulk, 'integration', 'page',
+            \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason'=>'blocked_domain']),
+            [$keyword]);
+        $expect($job['phase'] === 'scan', 'CLI test must start with unconfirmed scan');
+        echo $job['id'], "\n";
+        exit(0);
+    }
+    $jobID = getenv('ACH_IT_BG_JOB_ID') ?: '';
+    $expect((bool) preg_match('/^[0-9a-f]{24}$/D', $jobID), 'Expected unique CLI fixture job ID');
+    $job = \ACh\Yourls\UrlGuard\BulkHistory::load($bulk, $jobID, 'integration');
+    $expect($job !== null, 'Saved job must survive worker process restart');
+    if ($phase === 'background-ready') {
+        $expect($job['phase'] === 'ready' && $job['scanned'] === 1 && $job['matched'] === 1
+            && $job['deleted'] === 0, 'External CLI worker must dry-run, not delete');
+        $expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($bulk, $keyword) !== null,
+            'No user-visible link can be deleted before approval');
+        echo "PASS CLI background preview persisted ready state with zero deletions.\n";
+        // The AJAX callback must be authenticated and read-only. Its HTML
+        // includes the final gated DELETE form only after ready, not sooner.
+        yourls_set_user('integration');
+        yourls_add_filter('shunt_is_valid_user', static fn() => true);
+        $_SERVER['REQUEST_METHOD'] = 'GET';
+        $_GET = ['job' => $jobID];
+        ob_start();
+        ach_url_guard_bulk_ajax_status();
+        $json = ob_get_clean();
+        $_GET = [];
+        $status = json_decode($json, true);
+        $expect(is_array($status) && ($status['ok'] ?? null) === true
+            && ($status['phase'] ?? '') === 'ready'
+            && ($status['deleted'] ?? -1) === 0
+            && is_bool($status['stale'] ?? null)
+            && str_contains((string) ($status['html'] ?? ''), 'DELETE 1')
+            && str_contains((string) ($status['html'] ?? ''), 'Start confirmed background deletion'),
+            'Authenticated admin AJAX status returns ready form without writing');
+        $again = \ACh\Yourls\UrlGuard\BulkHistory::load($bulk, $jobID, 'integration');
+        $expect($again['phase'] === 'ready' && $again['deleted'] === 0,
+            'Status callback must not advance preview or authorize deletion');
+    } elseif ($phase === 'background-approve') {
+        $bad = false;
+        try { \ACh\Yourls\UrlGuard\BulkHistory::startDeletion($bulk, $jobID,
+            'integration', 'DELETE 2', true); } catch (InvalidArgumentException $e) { $bad = true; }
+        $expect($bad, 'Wrong DELETE count must not enqueue background deletion.');
+        $approved = \ACh\Yourls\UrlGuard\BulkHistory::startDeletion(
+            $bulk, $jobID, 'integration', 'DELETE 1', true);
+        $expect($approved['phase'] === 'delete', 'Exact confirmation can queue deletion.');
+        echo "PASS typed authorization enqueued only one fixture deletion.\n";
+    } elseif ($phase === 'background-done') {
+        $expect($job['phase'] === 'done' && $job['deleted'] === 1
+            && $job['processed'] === 1, 'CLI worker must finish one authorized deletion');
+        $expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($bulk, $keyword) === null,
+            'Only the approved test row is removed.');
+        $expect((string) $pdo->query("SELECT url FROM yourls_url WHERE keyword='yourlsblog'")->fetchColumn()
+            === 'https://blog.yourls.org/', 'Existing original redirect preserved after CLI worker');
+        echo "PASS CLI background deletion: exact approved fixture removed; legacy links unchanged.\n";
+    }
+    exit(0);
+}
 
 // This phase runs as three independent CLI processes against one disposable
 // YOURLS database. Native flood delay is enabled only for this focused probe.

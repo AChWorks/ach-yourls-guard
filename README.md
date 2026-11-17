@@ -84,7 +84,7 @@ Google Safe Browsing API is restricted to non-commercial use; this package does 
 
 **Do not deploy to a production host without the host owner's explicit approval for that exact operation.** In particular, enabling automatic rejections or an externally billed API is a separate policy decision from installing a plugin in monitor mode.
 
-## Review older links (admin page; manual deletion)
+## Review older links (authenticated admin: single or confirmed background bulk deletion)
 
 Open **YOURLS admin → Plugins → ACh URL Guard — Historical Review** (also linked from Guard settings). This page shows a cursor-paginated, read-only evaluation of **every existing link in the selected page** against the *current* local destination and reserved-alias rules. A positive local match is a **review candidate**, not proof of malware; a homepage-only URL or a rule term could be legitimate. The default scan does not perform DNSBL, Web Risk or HTTP requests and does not record private query tokens in its HTML.
 
@@ -98,9 +98,33 @@ Use **Filter and select existing links**. Choose **Only checked rows on this pag
 
 **Preview** performs a restartable keyset dry-run in small requests, creating one indexed private candidate table that stores only job ID, exact keyword, HMAC row snapshot, definite reason and processing outcome. No plaintext destination paths or query tokens are saved in these candidate records. Per-job progress/cursor and owner identity are saved in YOURLS options. The completed preview shows the exact matched count. Before deletion, the admin must check a confirmation box and type **DELETE N**, where N is the displayed matched count. Only previously snapshotted candidates can be deleted; new records are never substituted. Each attempt rechecks the current link, original proof, stored policy, metadata filter and reason; changed, healthy, or unknown records are skipped. Even if a slow HTTP verification started when the link had **zero clicks**, a concurrent click before the URL row lock prevents deletion under the zero-click filter. Date, keyword prefix and host criteria are also rechecked under the row lock, without holding a lock during network I/O.
 
-Execution works in bounded batches while the browser is open, with progress and a bookmarkable resume link. **Pause automatic continuation** stops only the browser's next submission and can be resumed from the saved job; **Cancel job permanently** puts that job into a terminal cancelled state and cannot resume it. Closing the browser pauses further requests. Neither cancellation nor deactivation restores deletions already committed. Completed/cancelled/paused report metadata can be cleared separately without touching short URLs.
+Execution is supported by an **operator-configured, host-local CLI background worker** rather than repeated browser POSTs. A normal admin page does not run work; progress is polled read-only through YOURLS's authenticated `admin-ajax.php` endpoint without reloading. Browser closure/navigation does not interrupt a properly scheduled worker, and the saved job can be bookmarked/reopened. In the absence of a configured worker, a saved Job waits, shows a stale-worker warning, and offers a deliberate **Run one batch manually** fallback. A worker error enters a stopped state and requires authenticated **Retry**; changing policy blocks retry and forces a new dry-run. A private structured PHP log records the job ID, operation phase/stage, UTC timestamp, safe exception class/code and a correlation reference. The admin error card includes this reference for troubleshooting. Neither destination URLs nor raw SQL parameters are written to the diagnostic event. **Cancel job** stops future batches but cannot restore any already committed deletion. Completed/cancelled/paused report metadata can be cleared separately without touching short URLs.
 
-**Network-derived bulk filters (HTTP 404/410, Private DNS address, Invalid redirect):** require explicit acknowledgment for outbound DNS/HTTP verification; check one destination per request during preview and again before deletion, with no DNSBL/Google API usage. It may require many browser requests for large datasets. The admin is responsible for deciding if a 404 is genuine; 403/429/5xx/timeouts and all other unknown results cannot authorize bulk removal.
+**Network-derived bulk filters (HTTP 404/410, Private DNS address, Invalid redirect):** require explicit acknowledgment for outbound DNS/HTTP verification; check one destination per request during preview and again before deletion, with no DNSBL/Google API usage. The background worker performs one network check per batch item and may require many scheduled executions for large datasets. The admin is responsible for deciding if a 404 is genuine; 403/429/5xx/timeouts and all other unknown results cannot authorize bulk removal.
+
+### Configure the background worker (required for unattended progress)
+
+The plugin does **not** install its own cron job. Before enabling cron, the site operator must inspect all saved jobs, especially when upgrading from v0.2.2:
+
+1. Install the approved plugin release **without enabling cron yet**. Run this **read-only** inventory command on the host (no credentials or destination URLs are printed):
+
+   ```bash
+   /usr/bin/php /path/to/yourls/user/plugins/ach-url-guard/bin/bulk-worker.php --site=/path/to/yourls --inspect
+   ```
+
+2. The host-local `--inspect` output prints each **exact job ID**, quoted **owning YOURLS account** (`owner="..."`), phase, counters and `legacy=yes` where applicable. Review **every** `phase=delete` line, including older records and jobs created by other administrators. These jobs already passed explicit confirmation, but enabling cron can resume them **without reopening the browser**. Do not assume the newest 30 global jobs represent every pending deletion.
+3. For each unwanted `phase=delete` job, ask the **original owning administrator** to sign in using **that exact YOURLS account**. Open **Historical Link Review → Saved review jobs**: all of that user's active deletion jobs appear above the recent list regardless of age. Alternatively, paste the job ID into **Open your job by exact ID**, or open `admin/plugins.php?page=ach_url_guard_history&bulk_job=JOB_ID` on the same YOURLS installation. Review its state, then use **Cancel job (completed deletions remain)**; repeat for other owners. A different authenticated administrator **cannot view or cancel another owner's job**. Re-run `--inspect` and verify the unwanted `phase=delete` records have become `phase=cancelled`. Cancellation does not restore already deleted URLs.
+4. If the owning account is **inactive, inaccessible or unavailable**, **do not enable the background scheduler** while that account has an unresolved `phase=delete` job. Recover the legitimate account through the site's established YOURLS access-management procedure and cancel from that account, or obtain a separately authorized, audited operator recovery/migration plan before proceeding. The plugin deliberately provides **no cross-owner or anonymous HTTP cancel endpoint** and **no privileged `--inspect` cancellation shortcut**. Never bypass ownership by rewriting serialized option values or clearing candidate snapshots.
+5. `phase=scan` resumes only the non-destructive preview; `phase=ready` is still unapproved and cannot be deleted without a fresh exact `DELETE N`. `done`, `paused`, `cancelled`, and `error` never execute automatically. **Do not erase candidate snapshots, history options or legacy job metadata** as a migration shortcut.
+6. Only after the owner-by-owner inventory is resolved and any remaining deletion jobs are intentionally approved to continue should the operator separately configure a host-local scheduler running as the YOURLS site account. For example, on a conventional host with PHP CLI and cron:
+
+```cron
+* * * * * /usr/bin/php /path/to/yourls/user/plugins/ach-url-guard/bin/bulk-worker.php --site=/path/to/yourls --seconds=45
+```
+
+Use the actual installed PHP binary and YOURLS path. The CLI refuses HTTP invocation and inactive plugins. Every invocation obtains a **MariaDB/MySQL advisory lock** derived from the shared database name and table prefix, not a local filesystem path. Workers on different application hosts connected to the **same MariaDB/MySQL server endpoint** contend on the same connection-scoped lock, released on exit or disconnect; overlapping cron invocations do not concurrently run that workload. The lock is **not** globally coordinated across distinct database server instances (for example, independent multi-primary writers); coordinate those schedulers separately before enabling them. It runs only already-authorized scan jobs and previously admin-confirmed deletion jobs, retains bounded transaction/HTTP safeguards, and stops within the operator-selected invocation time budget (aside from any in-flight bounded request). It does **not** create jobs, enable providers, or perform unattended sitewide audits. No credentials are passed on the command line; keep server log output private. A no-job run exits quietly. For local diagnostics, run the same command once and inspect the job card's updated progress. Ensure any job is finished/cancelled before disabling the scheduler during a plugin update.
+
+**Dry-run first, deletion only after separate confirmation:** a completed `ready` job exposes the exact typed `DELETE N` and checkbox; until then the current matched count is partial and cannot be used to authorize deletion. The `I approve outbound HTTP/DNS` checkbox permits only the selected network filters, not deletion.
 
 Use a tested backup and specific Production permission before permanent deletion. Native YOURLS delete hooks may have external effects not reversible by a database rollback. The job report does not store a full destination-URL export.
 
@@ -116,7 +140,7 @@ php bin/audit.php --site=/path/to/yourls --limit=200 --after=LAST_KEYWORD
 
 Options: `--network` checks HTTPS reachability; `--reputation` uses Google Web Risk if a key is configured. These flags can generate external requests/costs; without them it is purely a structural/domain-policy audit. Results are CSV on STDOUT; progress and next cursor go to STDERR. By default this scans a finite batch of 200, and the operator can choose their own batch size. Protect exported CSV because destination URL query strings may contain sensitive material.
 
-**No cron is installed; no existing URLs are automatically deleted or blocked.** Historical deletion occurs only via a separately confirmed admin action.
+**No cron is installed by the plugin.** Operators can separately schedule the opt-in bulk worker; no new scanning or deletion job is created automatically and existing redirects are never blocked. Historical deletion occurs only via a separately confirmed admin action.
 
 ## Tests
 
@@ -133,6 +157,16 @@ YOURLS_SOURCE=/path/to/YOURLS-1.10.6 FORCE_LOWERCASE_SOURCE=/path/to/force-lower
 ```
 
 Coverage includes the default anti-chaining domain rules, custom alias cap in Monitor/Enforce and 0-disable behavior, local URL terms/Regex and reserved aliases, invalid admin-rule rejection and real HTTP API status checks, as well as root-only URLs, exact/wildcard rules, private/reserved addresses, numeric aliases, dangerous redirect targets, GET-only redirect validation, HTTP error handling, Google Web Risk and DNSBL mocks, unknown handling, and the YOURLS shunt/monitor/enforce contract. Network calls are mocked in the test harness, so no outside URLs are fetched. The cURL transport tests explicitly verify that failed option configuration never executes a network request and that DNS pinning, TLS and proxy restrictions are selected. The hook contract uses the actual upstream YOURLS filter implementation, without an active database. Additional historical review regressions verify paginated previews, non-secret HTML, stale-record/rule protection, nonce and confirmation handling, and deliberate fixture-only native deletion. The separate database/HTTP integration test installs actual YOURLS 1.10.6 into a disposable MariaDB instance and isolated site, loads Random ShortURLs, Allow Hyphens, Force Lowercase and ACh URL Guard, verifies monitoring/enforcement, authenticated HTTP API allow/deny and HTTP status, existing/new redirect targets, protected admin settings, and compares a full database snapshot before/after the read-only historical audit. It never fetches an external test URL or points at Production.
+
+The background Job progress UI has a separate real-browser regression using
+`tests/bulk-progress-fixture.php` and
+`tests/bulk-progress-browser.mjs`. The fixture renders the actual production
+polling JavaScript. An isolated Playwright Chromium page simulates four terminal
+transitions while keyboard focus remains on an old control, verifies the final
+card is visible without reload, preserves an entered DELETE N value and focus,
+and distinguishes expired login from transient connectivity errors. No live
+site or external HTTP request is involved; these browser checks are optional
+outside the PHP-only CI jobs.
 
 The responsive Historical Review renderer also has a synthetic browser fixture
 `tests/history-layout-fixture.php` and an isolated Playwright regression
@@ -156,7 +190,7 @@ This plugin **does not** normalize the path/keyword portion of lrl.li short URLs
 
 - HTTP status is not a definitive existence/quality or safety oracle. Authentication, geo-blocking, anti-bot challenges, rate limiting and transient failures can make good sites appear unavailable.
 - Google Web Risk and DNSBL have limited list coverage and may have false positives/negatives. They cannot guarantee that a link will never trigger Google Search Console or Cloudflare warnings. Reported abuse and malicious existing links still require operational review and service-provider reconsideration.
-- Since v0.2.0, the plugin supports individually confirmed deletion and operator-approved filtered bulk deletion. A plugin-owned candidate table is created on the first bulk preview, and small resume/progress records are stored in YOURLS options. There is no autonomous background worker, cron, Search Console or Cloudflare integration.
+- Since v0.2.0, the plugin supports individually confirmed deletion and operator-approved filtered bulk deletion. A plugin-owned candidate table is created on the first bulk preview, and small resume/progress records are stored in YOURLS options. Since v0.2.3, a host-local, operator-installed cron/CLI worker may independently process explicitly created review jobs and already confirmed deletions; no scheduler is installed automatically. There is no Search Console or Cloudflare integration.
 - Internationalized domain names should be supplied in standard ASCII/Punycode form. No extra composer dependencies or vendor packages are required.
 - CIDR safety checks use protocol/IANA special-purpose network assignments, independently of PHP's incomplete reserved-address flags; these safety boundaries may require maintenance when authoritative registries change.
 - HTTP redirect checking does not render JavaScript or execute a browser. JS-only redirects cannot be inferred reliably from an HTTP header.

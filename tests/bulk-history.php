@@ -12,12 +12,15 @@ require dirname(__DIR__) . '/src/Guard.php';
 require dirname(__DIR__) . '/src/Reputation.php';
 require dirname(__DIR__) . '/src/HistoricalReview.php';
 require dirname(__DIR__) . '/src/BulkHistory.php';
+require dirname(__DIR__) . '/src/HistoryWorker.php';
 use ACh\Yourls\UrlGuard\BulkHistory;
+use ACh\Yourls\UrlGuard\HistoryWorker;
 use ACh\Yourls\UrlGuard\HistoricalReview;
 
 final class BulkSqlite
 {
     private PDO $pdo;
+    public bool $injectReadFailure = false;
     public function __construct()
     {
         $this->pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
@@ -41,6 +44,10 @@ final class BulkSqlite
     }
     public function fetchAll(string $sql, array $binds = []): array
     {
+        if ($this->injectReadFailure
+            && str_contains($sql, 'SELECT keyword,url,title,timestamp,clicks FROM')) {
+            throw new PDOException('https://example.com/private?token=DO_NOT_LOG password=DO_NOT_LOG');
+        }
         return $this->prep($sql, $binds)->fetchAll(PDO::FETCH_ASSOC);
     }
     public function fetchOne(string $sql, array $binds = []): array|false
@@ -330,5 +337,189 @@ assertBulk($job['phase'] === 'ready' && $job['matched'] === 0
     'unknown DNS outcome never enters destructive candidate snapshot');
 BulkHistory::cancel($db, $job['id'], 'fixture-admin');
 BulkHistory::clear($db, $job['id'], 'fixture-admin');
+
+
+// Background worker: dry-run cannot self-authorize deletion. No browser
+// requests, HTTP side effects or external service calls are required.
+$db->fetchAffected('INSERT INTO yourls_url(keyword,url,title,timestamp,clicks)'
+    . ' VALUES (:key,:url,:title,:time,0)', [
+    'key' => 'worker-reviewed', 'url' => 'https://bit.ly/worker-target?secret=NEVER_EXPOSE_WORKER',
+    'title' => 'worker fixture', 'time' => '2026-11-12 10:00:00',
+]);
+$background = BulkHistory::create($db, 'fixture-admin', 'page',
+    BulkHistory::filter(['reason' => 'blocked_domain']), ['worker-reviewed']);
+assertBulk(count(BulkHistory::runnableJobs($db)) === 1, 'only unconfirmed scan is runnable');
+$run = HistoryWorker::run($db, 1);
+$ready = BulkHistory::load($db, $background['id'], 'fixture-admin');
+assertBulk($run['steps'] >= 1 && $run['failures'] === 0,
+    'headless worker completes a saved preview with no client/browser');
+assertBulk($ready['phase'] === 'ready' && $ready['matched'] === 1
+    && $ready['deleted'] === 0 && HistoricalReview::find($db, 'worker-reviewed') !== null,
+    'scan stops at ready; no background deletion before explicit approval');
+assertBulk(BulkHistory::runnableJobs($db) === [], 'ready job never enters background deletion');
+$run = HistoryWorker::run($db, 1);
+assertBulk($run['steps'] === 0 && HistoricalReview::find($db, 'worker-reviewed') !== null,
+    'idle worker cannot delete unconfirmed candidate');
+$badApproval = false;
+try {
+    BulkHistory::startDeletion($db, $background['id'], 'fixture-admin', 'DELETE 999', true);
+} catch (InvalidArgumentException $error) {
+    $badApproval = true;
+}
+assertBulk($badApproval && BulkHistory::runnableJobs($db) === [],
+    'wrong typed confirmation does not enqueue deletion');
+$delete = BulkHistory::startDeletion($db, $background['id'], 'fixture-admin', 'DELETE 1', true);
+assertBulk($delete['phase'] === 'delete', 'exact approval transitions a ready snapshot into delete');
+$run = HistoryWorker::run($db, 1);
+$done = BulkHistory::load($db, $background['id'], 'fixture-admin');
+assertBulk($run['steps'] >= 1 && $done['phase'] === 'done'
+    && $done['deleted'] === 1 && HistoricalReview::find($db, 'worker-reviewed') === null,
+    'approved worker deletes only its verified fixture candidate and terminates');
+BulkHistory::clear($db, $background['id'], 'fixture-admin');
+
+// Fail-closed worker errors require an owner action, and cannot bypass policy
+// changes or restart an abandoned deletion confirmation.
+$failure = BulkHistory::create($db, 'fixture-admin', 'page',
+    BulkHistory::filter(['reason' => 'blocked_domain']), ['l0000']);
+$failed = BulkHistory::fail($db, $failure['id'], 'fixture-admin', 'PDOException');
+assertBulk($failed['phase'] === 'error' && $failed['retry_phase'] === 'scan'
+    && $failed['error_class'] === 'PDOException',
+    'unexpected worker exception recorded without raw SQL, URL, or secret');
+assertBulk(BulkHistory::runnableJobs($db) === [], 'failed job never silently retries');
+$retry = BulkHistory::retry($db, $failure['id'], 'fixture-admin');
+assertBulk($retry['phase'] === 'scan' && $retry['error_class'] === ''
+    && count(BulkHistory::runnableJobs($db)) === 1,
+    'authenticated retry resumes exact cursor and same policy');
+$cancel = BulkHistory::cancel($db, $failure['id'], 'fixture-admin');
+assertBulk($cancel['phase'] === 'cancelled' && BulkHistory::runnableJobs($db) === [],
+    'cancel removes worker eligibility without changing URL records');
+BulkHistory::clear($db, $failure['id'], 'fixture-admin');
+$policyFailure = BulkHistory::create($db, 'fixture-admin', 'page',
+    BulkHistory::filter(['reason' => 'blocked_domain']), ['l0000']);
+BulkHistory::fail($db, $policyFailure['id'], 'fixture-admin', 'RuntimeException');
+$db->fetchAffected('UPDATE yourls_options SET option_value=:v WHERE option_name=:k',
+    ['k' => 'ach_url_guard_settings', 'v' => serialize(['mode' => 'monitor'])]);
+$paused = BulkHistory::retry($db, $policyFailure['id'], 'fixture-admin');
+assertBulk($paused['phase'] === 'paused' && BulkHistory::runnableJobs($db) === [],
+    'changed policy blocks retry and requires a new dry-run');
+BulkHistory::clear($db, $policyFailure['id'], 'fixture-admin');
+
+// Lock identity must match for different filesystem paths sharing one
+// database schema and differ across independent database namespaces.
+$lock = \ACh\Yourls\UrlGuard\HistoryWorker::lockName('db-site-a', 'yourls_');
+assertBulk($lock === \ACh\Yourls\UrlGuard\HistoryWorker::lockName('db-site-a', 'yourls_')
+    && $lock !== \ACh\Yourls\UrlGuard\HistoryWorker::lockName('db-site-b', 'yourls_')
+    && strlen($lock) <= 64,
+    'MySQL lock name is schema/prefix scoped, not local-path scoped');
+
+// Fault injection: diagnose a failed persisted job with a private structured
+// event, without serializing/logging secret exception messages.
+$failedJob = BulkHistory::create($db, 'fixture-admin', 'all',
+    BulkHistory::filter(['reason' => 'any']), []);
+$logPath = tempnam(sys_get_temp_dir(), 'ach-bg-worker-errors-');
+assertBulk(is_string($logPath), 'Private log target available');
+$previousLog = ini_get('error_log');
+$previousLogging = ini_get('log_errors');
+ini_set('error_log', $logPath);
+ini_set('log_errors', '1');
+$db->injectReadFailure = true;
+try {
+    $failureRun = HistoryWorker::run($db, 1);
+} finally {
+    $db->injectReadFailure = false;
+    ini_set('error_log', (string) $previousLog);
+    ini_set('log_errors', (string) $previousLogging);
+}
+$failedState = BulkHistory::load($db, $failedJob['id'], 'fixture-admin');
+$privateLog = (string) file_get_contents($logPath);
+@unlink($logPath);
+assertBulk($failureRun['failures'] === 1 && $failureRun['steps'] === 0
+    && $failedState['phase'] === 'error'
+    && ($failedState['error_info']['phase'] ?? '') === 'scan'
+    && ($failedState['error_info']['stage'] ?? '') === 'scan_step'
+    && ($failedState['error_info']['code'] ?? '') === '0'
+    && preg_match('/^[a-f0-9]{16}$/D', (string) ($failedState['error_info']['ref'] ?? ''))
+    && $failedState['error_class'] === 'PDOException',
+    'Controlled worker read failure persists safe stage/category/code/UTC/correlation ID');
+assertBulk(str_contains($privateLog, '"job_id":"' . $failedJob['id'] . '"')
+    && str_contains($privateLog, '"stage":"scan_step"')
+    && str_contains($privateLog, '"category":"PDOException"')
+    && !str_contains($privateLog, 'DO_NOT_LOG')
+    && !str_contains($privateLog, 'https://example.com')
+    && !str_contains(serialize($failedState), 'DO_NOT_LOG'),
+    'Private logs identify failure without URLs, credentials or exception message');
+assertBulk(BulkHistory::runnableJobs($db) === [],
+    'Failed job is not silently retried by another scheduler invocation');
+$recovered = BulkHistory::retry($db, $failedJob['id'], 'fixture-admin');
+assertBulk($recovered['phase'] === 'scan'
+    && !array_key_exists('error_info', $recovered),
+    'Owner-initiated retry clears the error and retains the original cursor');
+BulkHistory::cancel($db, $failedJob['id'], 'fixture-admin');
+BulkHistory::clear($db, $failedJob['id'], 'fixture-admin');
+
+
+// N1: global newest-30 LIMIT must never hide an older approved delete job,
+// even if 36 newer jobs belong to each of two different administrators.
+$makeSavedJob = static function (string $owner, string $phase) use ($db): string {
+    $id = bin2hex(random_bytes(12));
+    $saved = [
+        'id' => $id, 'owner' => $owner, 'phase' => $phase,
+        'matched' => 1, 'deleted' => 0, 'scanned' => 1,
+        'updated_at' => '', // old v0.2.2 compatible format
+    ];
+    $db->fetchAffected('INSERT INTO yourls_options (option_name,option_value)'
+        . ' VALUES (:key,:value)', [
+        'key' => 'ach_url_guard_bulk_' . $id, 'value' => serialize($saved),
+    ]);
+    return $id;
+};
+$oldOwned = $makeSavedJob('fixture-admin', 'delete');
+$oldOther = $makeSavedJob('another-admin', 'delete');
+$oldUnavailable = $makeSavedJob('inactive-owner', 'delete');
+for ($i = 0; $i < 36; $i++) {
+    $makeSavedJob('fixture-admin', 'scan');
+    $makeSavedJob('another-admin', 'ready');
+}
+$owned = BulkHistory::recentJobs($db, 'fixture-admin');
+$otherOwned = BulkHistory::recentJobs($db, 'another-admin');
+assertBulk(count($owned) === 31 && count($otherOwned) === 31,
+    'newest 30 per owner plus every older deletion, regardless of global recency');
+assertBulk(in_array($oldOwned, array_column($owned, 'id'), true)
+    && in_array($oldOther, array_column($otherOwned, 'id'), true),
+    'both active delete jobs remain visible to their respective original owners');
+assertBulk(!in_array($oldOther, array_column($owned, 'id'), true)
+    && !in_array($oldUnavailable, array_column($owned, 'id'), true)
+    && !in_array($oldOwned, array_column($otherOwned, 'id'), true),
+    'other owners cannot enumerate active deletion jobs');
+assertBulk(count(BulkHistory::recentJobs($db, 'inactive-owner')) === 1,
+    'unavailable owner job is retained for the host operator inventory');
+$inventory = BulkHistory::jobInventory($db);
+$all = array_column($inventory, null, 'id');
+assertBulk($all[$oldOwned]['owner'] === 'fixture-admin'
+    && $all[$oldOther]['owner'] === 'another-admin'
+    && $all[$oldUnavailable]['owner'] === 'inactive-owner'
+    && $all[$oldOwned]['phase'] === 'delete',
+    'read-only host inventory carries exact owning identity and job phase');
+$wrongCancel = false;
+try {
+    BulkHistory::cancel($db, $oldOther, 'fixture-admin');
+} catch (RuntimeException $error) {
+    $wrongCancel = true;
+}
+assertBulk($wrongCancel
+    && BulkHistory::load($db, $oldOther, 'another-admin')['phase'] === 'delete',
+    'non-owner cannot cancel older delete-phase job');
+$ownedCancel = BulkHistory::cancel($db, $oldOwned, 'fixture-admin');
+$otherCancel = BulkHistory::cancel($db, $oldOther, 'another-admin');
+assertBulk($ownedCancel['phase'] === 'cancelled'
+    && $otherCancel['phase'] === 'cancelled'
+    && BulkHistory::load($db, $oldUnavailable, 'inactive-owner')['phase'] === 'delete',
+    'original owners can cancel; unavailable account remains a documented cron blocker');
+assertBulk(!in_array($oldOwned, array_column(
+    array_filter(BulkHistory::recentJobs($db, 'fixture-admin'),
+        static fn(array $job): bool => $job['phase'] === 'delete'), 'id'), true),
+    'cancelled legacy deletion is no longer shown as pending destructive work');
+
+assertBulk($checks > 65, 'background job assertions ran');
 
 echo 'PASS '.$checks.' bulk selection/filter/snapshot/chunk/cancel/network-state assertions in disposable SQLite'.PHP_EOL;

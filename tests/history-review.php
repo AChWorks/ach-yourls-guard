@@ -148,6 +148,18 @@ catch (RuntimeException $e) { $anonymousSettingsDenied = true; ob_end_clean(); }
 check($anonymousSettingsDenied, 'neighboring Guard settings page is also restricted');
 $historyAuthenticated = true;
 $_SERVER['REQUEST_METHOD'] = 'GET'; $_POST = [];
+ob_start();
+ach_url_guard_admin_page();
+$settingsView = ob_get_clean();
+check(str_contains($settingsView, 'Automatic Guard rules apply to newly created links')
+    && str_contains($settingsView, 'not changed automatically')
+    && str_contains($settingsView, 'individual review')
+    && str_contains($settingsView, 'filtered historical batch after a completed dry-run')
+    && str_contains($settingsView, 'exact DELETE N')
+    && str_contains($settingsView, 'background worker')
+    && !str_contains($settingsView, 'unless an admin explicitly reviews and deletes an individual historical link'),
+    'Guard settings explain new-link enforcement, individual and background bulk deletion accurately');
+
 
 check(HistoricalReview::inspect($db->rows['bad'], $settings)['reason'] === 'blocked_domain', 'blocked domain flagged');
 check(HistoricalReview::inspect($db->rows['home'], $settings)['reason'] === 'root_url', 'homepage-only flagged');
@@ -245,6 +257,12 @@ check(str_contains($html, 'Select All Matching Filters across every page'),
 check(str_contains($html, 'name="bulk_keywords[]"'), 'table row checkbox attached to filter form');
 check(str_contains($html, 'name="bulk_filter[reason]"'), 'reason filter visible');
 check(str_contains($html, 'name="bulk_filter[clicks]"'), 'clicks filter visible');
+check(str_contains($html, 'Open your job by exact ID')
+    && str_contains($html, 'name="bulk_job"')
+    && str_contains($html, 'pattern="[0-9a-f]{24}"')
+    && str_contains($html, 'Jobs are private to the YOURLS account'),
+    'Owner-scoped exact ID recovery exists even when the recent list is empty');
+
 
 check(str_contains($html, 'Check HTTP'), 'clean old rows can receive a manual HTTP check');
 check(!str_contains($html, 'NEVER_SHOW') && !str_contains($html, 'DO_NOT_EXPOSE')
@@ -408,6 +426,59 @@ foreach (['missing-404','missing-410','healthy-200','blocked-403','rate-429','se
             $settings, $probeNetwork) === 'stale', 'repeat network delete inert ' . $case);
     }
 }
+
+
+// In-place UX contract: large scans no longer re-POST the entire admin page.
+// Destructive confirmation is absent until the saved dry-run reaches ready.
+$jobUi = [
+    'id'=>str_repeat('a',24), 'phase'=>'scan', 'mode'=>'all',
+    'scanned'=>21100, 'matched'=>2217, 'processed'=>0,
+    'deleted'=>0, 'skipped'=>0, 'updated_at'=>gmdate('c'),
+    'filter'=>['reason'=>'any','clicks'=>'any','host'=>'','prefix'=>'','before'=>''],
+];
+ob_start();ach_url_guard_bulk_job($jobUi);$scanUI=ob_get_clean();
+check(str_contains($scanUI, 'No short links are deleted during scanning')
+    && str_contains($scanUI, 'Run one scan batch manually')
+    && !str_contains($scanUI, 'bulk_confirm_text')
+    && !str_contains($scanUI, 'Start confirmed background deletion'),
+    'scan state cannot show deletion action before completed preview');
+$jobUi['phase'] = 'ready';
+ob_start();ach_url_guard_bulk_job($jobUi);$readyUI=ob_get_clean();
+check(str_contains($readyUI, 'DELETE 2217')
+    && str_contains($readyUI, 'Start confirmed background deletion')
+    && str_contains($readyUI, 'without individual manual review'),
+    'ready state shows precise typed confirmation and destructive scope');
+ob_start();ach_url_guard_bulk_poll_script($jobUi['id']);$pollJS=ob_get_clean();
+check(str_contains($pollJS, 'admin-ajax.php?action=ach_guard_bulk_status')
+    && str_contains($pollJS, 'fetch(endpoint')
+    && str_contains($pollJS, 'box.innerHTML = data.html')
+    && str_contains($pollJS, 'pending.innerHTML = data.html')
+    && str_contains($pollJS, 'box.addEventListener("focusout"')
+    && str_contains($pollJS, 'data.stale')
+    && str_contains($pollJS, 'reconnecting automatically')
+    && !str_contains($pollJS, 'location.reload(')
+    && !str_contains($pollJS, 'form.submit('),
+    'live progress polls JSON and updates a card without page reload');
+$jobUi['phase']='error';
+$jobUi['retry_phase']='scan';
+$jobUi['error_class']='PDOException';
+$jobUi['error_info'] = [
+    'stage'=>'scan_step', 'occurred_at'=>'2026-11-17T12:00:00Z',
+    'code'=>'HY000', 'ref'=>'1234567890abcdef',
+];
+ob_start();ach_url_guard_bulk_job($jobUi);$errorUI=ob_get_clean();
+check(str_contains($errorUI, 'Retry background processing')
+    && str_contains($errorUI, 'No background processing will continue until an admin retries.')
+    && str_contains($errorUI, 'scan_step')
+    && str_contains($errorUI, '1234567890abcdef')
+    && str_contains($errorUI, 'HY000'),
+    'server worker error card gives safe stage/code/correlation context');
+$jobUi['phase']='delete';
+unset($jobUi['updated_at']);
+ob_start();ach_url_guard_bulk_job($jobUi);$legacyUI=ob_get_clean();
+check(str_contains($legacyUI, 'Legacy delete-phase job:')
+    && str_contains($legacyUI, 'Enabling the scheduler will resume'),
+    'legacy pending destructive job has explicit operator warning');
 
 check(in_array('ach_url_guard_history_delete', $nonceActions, true), 'delete nonce checked');
 

@@ -147,6 +147,7 @@ final class BulkHistory
             'ceiling' => (string) ($high['keyword'] ?? ''), 'cursor' => '',
             'scanned' => 0, 'matched' => 0, 'processed' => 0,
             'deleted' => 0, 'skipped' => 0, 'reason_counts' => [],
+            'updated_at' => gmdate('c'), 'error_class' => '',
         ];
         $n = $db->fetchAffected('INSERT INTO ' . self::optionsTable()
             . ' (option_name, option_value) VALUES (:name, :value)',
@@ -170,35 +171,132 @@ final class BulkHistory
 
     private static function save($db, array $job): void
     {
+        $job['updated_at'] = gmdate('c');
         $n = $db->fetchAffected('UPDATE ' . self::optionsTable()
             . ' SET option_value = :value WHERE option_name = :name',
             ['value' => serialize($job), 'name' => self::optionName((string) $job['id'])]);
         if ((int) $n !== 1) throw new \RuntimeException('Could not save review progress');
     }
 
-    /** Recovery links for the authenticated owner's recent saved jobs. */
+    /**
+     * Recover the newest saved jobs belonging to one authenticated owner,
+     * PLUS every still-running delete-phase job of that owner, regardless of
+     * age. A global SQL LIMIT would hide older destructive jobs when other
+     * administrators have created newer records.
+     *
+     * The normalized inventory is used here, so the list never crosses owner
+     * boundaries. This method is read-only and does not change job phases.
+     */
     public static function recentJobs($db, string $owner): array
     {
+        $jobs = array_values(array_filter(self::jobInventory($db),
+            static fn(array $job): bool => $job['owner'] === $owner));
+        $jobs = array_reverse($jobs); // newest first, like the prior Recent UI
+        $recent = array_slice($jobs, 0, 30);
+        $included = array_fill_keys(array_column($recent, 'id'), true);
+        foreach ($jobs as $job) {
+            if ($job['phase'] === 'delete' && !isset($included[$job['id']])) {
+                $recent[] = $job;
+            }
+        }
+        return $recent;
+    }
+
+    /** Inspect the whole saved job inventory before enabling a scheduler.
+     * In particular, a legacy v0.2.2 delete-phase job was already approved
+     * and would resume once a worker is first enabled.
+     */
+    public static function jobInventory($db): array
+    {
         $rows = $db->fetchAll('SELECT option_name, option_value FROM ' . self::optionsTable()
-            . ' WHERE option_name LIKE :prefix ORDER BY option_id DESC LIMIT 30',
+            . ' WHERE option_name LIKE :prefix ORDER BY option_id ASC',
             ['prefix' => self::OPTION_PREFIX . '%']);
-        $jobs = [];
+        $active = [];
         foreach ($rows as $row) {
             $name = (string) ($row['option_name'] ?? '');
-            if (!str_starts_with($name, self::OPTION_PREFIX)) continue;
             $id = substr($name, strlen(self::OPTION_PREFIX));
-            if (!preg_match('/^[0-9a-f]{24}$/D', $id)) continue;
-            $job = yourls_maybe_unserialize((string) ($row['option_value'] ?? ''));
-            if (!is_array($job) || ($job['owner'] ?? '') !== $owner || ($job['id'] ?? '') !== $id) {
+            if (!str_starts_with($name, self::OPTION_PREFIX)
+                || !preg_match('/^[0-9a-f]{24}$/D', $id)) {
                 continue;
             }
-            $jobs[] = [
-                'id' => $id, 'phase' => (string) ($job['phase'] ?? 'unknown'),
+            $job = yourls_maybe_unserialize((string) ($row['option_value'] ?? ''));
+            if (!is_array($job) || ($job['id'] ?? '') !== $id
+                || !is_string($job['owner'] ?? null) || $job['owner'] === ''
+                || !in_array($job['phase'] ?? null,
+                    ['scan', 'ready', 'delete', 'done', 'paused', 'cancelled', 'error'], true)) {
+                continue;
+            }
+            $active[] = [
+                'id' => $id, 'owner' => $job['owner'], 'phase' => (string) $job['phase'],
+                'scanned' => (int) ($job['scanned'] ?? 0),
                 'matched' => (int) ($job['matched'] ?? 0),
                 'deleted' => (int) ($job['deleted'] ?? 0),
+                'updated_at' => (string) ($job['updated_at'] ?? ''),
             ];
         }
-        return $jobs;
+        return $active;
+    }
+
+    public static function runnableJobs($db): array
+    {
+        return array_values(array_filter(self::jobInventory($db),
+            static fn(array $job): bool => in_array($job['phase'], ['scan', 'delete'], true)));
+    }
+
+    /** Stop a failed worker job for an explicit admin retry; never retry a
+     * destructive batch indefinitely or expose raw exception messages. */
+    public static function fail($db, string $id, string $owner, string $errorClass,
+        array $details = []): array
+    {
+        $db->beginTransaction();
+        try {
+            $job = self::load($db, $id, $owner, true);
+            if ($job === null) throw new \RuntimeException('Job unavailable');
+            if (in_array($job['phase'], ['scan', 'delete'], true)) {
+                $job['retry_phase'] = $job['phase'];
+                $job['phase'] = 'error';
+                $job['error_class'] = preg_replace('/[^A-Za-z0-9_]/', '', str_replace('\\', '_', $errorClass));
+                $job['error_info'] = [
+                    'phase' => $job['retry_phase'],
+                    'stage' => (string) ($details['stage'] ?? 'job_step'),
+                    'code' => (string) ($details['code'] ?? ''),
+                    'occurred_at' => (string) ($details['occurred_at'] ?? gmdate('c')),
+                    'ref' => (string) ($details['ref'] ?? ''),
+                ];
+                self::save($db, $job);
+            }
+            $db->commit();
+            return $job;
+        } catch (\Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
+    }
+
+    /** Retry preserves cursor and snapshot; changing policy never unpauses a
+     * stale job, particularly after deletion authorization. */
+    public static function retry($db, string $id, string $owner): array
+    {
+        $db->beginTransaction();
+        try {
+            $job = self::load($db, $id, $owner, true);
+            if ($job === null || $job['phase'] !== 'error'
+                || !in_array($job['retry_phase'] ?? null, ['scan', 'delete'], true)) {
+                throw new \InvalidArgumentException('Only failed jobs can be retried');
+            }
+            $settings = HistoricalReview::storedSettings($db, true);
+            $job['phase'] = hash_equals((string) $job['policy_hash'], self::policyHash($settings))
+                ? $job['retry_phase'] : 'paused';
+            unset($job['retry_phase']);
+            $job['error_class'] = '';
+            unset($job['error_info']);
+            self::save($db, $job);
+            $db->commit();
+            return $job;
+        } catch (\Throwable $error) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $error;
+        }
     }
 
     /** Bounded keyset scan; never serializes an unbounded keyword list. */
@@ -464,7 +562,7 @@ final class BulkHistory
         try {
             $job = self::load($db, $id, $owner, true);
             if ($job === null) throw new \RuntimeException('Review job unavailable');
-            if (in_array($job['phase'], ['scan', 'ready', 'delete'], true)) {
+            if (in_array($job['phase'], ['scan', 'ready', 'delete', 'error'], true)) {
                 $job['phase'] = 'cancelled';
                 self::save($db, $job);
             }
