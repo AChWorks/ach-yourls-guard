@@ -104,7 +104,7 @@ Execution works in bounded batches while the browser is open, with progress and 
 
 Use a tested backup and specific Production permission before permanent deletion. Native YOURLS delete hooks may have external effects not reversible by a database rollback. The job report does not store a full destination-URL export.
 
-Only destination **hostnames** are displayed in the review table; URL paths, embedded credentials and query values are never rendered by this page. The exact keyword lets an authorized operator inspect the intended link through existing YOURLS administration if more context is needed.
+The review **table** shows only destination hostnames, not URL paths, embedded credentials or query values. After the authenticated admin explicitly selects **Review deletion** for one exact link, its confirmation shows both the full short URL and the full original destination URL (which may contain private tokens). The display stays on one line and abbreviates long strings with `[...]`; Copy preserves the full address. URLs are displayed as inert text, never automatically opened, and are not written to logs or bulk job records. Avoid sharing screenshots of a confirmation containing sensitive destinations.
 
 ## Inspect old links (read-only CLI)
 

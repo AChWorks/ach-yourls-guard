@@ -41,6 +41,110 @@ function ach_url_guard_history_reason_label(string $reason): string
     return $labels[$reason] ?? ucwords(str_replace('_', ' ', $reason));
 }
 
+/** Abbreviate only the visible label; the Copy control keeps the exact value. */
+function ach_url_guard_history_compact_parts(string $value, int $max = 80): array
+{
+    $max = max(16, $max);
+    if (strlen($value) <= $max) {
+        return ['truncated' => false, 'head' => $value, 'tail' => ''];
+    }
+    $chars = preg_split('//u', $value, -1, PREG_SPLIT_NO_EMPTY);
+    // Invalid legacy UTF-8 must not break the review page.
+    if ($chars === false) {
+        $chars = str_split($value);
+    }
+    if (count($chars) <= $max) {
+        return ['truncated' => false, 'head' => $value, 'tail' => ''];
+    }
+    $remaining = $max - strlen('[...]');
+    $head = (int) ceil($remaining * 0.7);
+    $tail = $remaining - $head;
+    return [
+        'truncated' => true,
+        'head' => implode('', array_slice($chars, 0, $head)),
+        'tail' => implode('', array_slice($chars, -$tail)),
+    ];
+}
+
+function ach_url_guard_history_compact(string $value, int $max = 80): string
+{
+    $parts = ach_url_guard_history_compact_parts($value, $max);
+    return $parts['truncated'] ? $parts['head'] . '[...]' . $parts['tail'] : $value;
+}
+
+/** Keep [...] and the suffix visible even when a narrow column clips the prefix. */
+function ach_url_guard_history_compact_html(string $value, int $max = 80): string
+{
+    $parts = ach_url_guard_history_compact_parts($value, $max);
+    if (!$parts['truncated']) {
+        return ach_url_guard_esc($value);
+    }
+    return '<span class="ach-history-prefix">' . ach_url_guard_esc($parts['head']) . '</span>'
+        . '<span class="ach-history-marker" aria-hidden="true">[...]</span>'
+        . '<span class="ach-history-suffix">' . ach_url_guard_esc($parts['tail']) . '</span>';
+}
+
+/**
+ * A full URL is intentionally available only after the exact authenticated
+ * individual review. Keep the value inert: no anchor, fetch, navigation or log.
+ */
+function ach_url_guard_history_url_field(string $label, string $value): void
+{
+    echo '<div class="ach-history-url-field">';
+    echo '<strong>' . ach_url_guard_esc($label) . '</strong>';
+    echo '<code class="ach-history-one-line" dir="ltr" title="' . ach_url_guard_esc($value)
+        . '">' . ach_url_guard_history_compact_html($value) . '</code>';
+    echo '<button type="button" class="button ach-history-copy" data-copy-url="'
+        . ach_url_guard_esc($value) . '" aria-label="Copy ' . ach_url_guard_esc($label)
+        . '">Copy</button></div>';
+}
+
+function ach_url_guard_history_copy_script(): void
+{
+    echo <<<'HTML'
+<script>
+(function () {
+    var status = document.getElementById('ach-history-copy-status');
+    function legacyCopy(value) {
+        var field = document.createElement('textarea');
+        field.value = value;
+        field.readOnly = true;
+        field.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
+        document.body.appendChild(field);
+        var previousFocus = document.activeElement;
+        field.focus();
+        field.select();
+        var success = false;
+        try { success = document.execCommand('copy'); }
+        catch (e) { success = false; }
+        field.remove();
+        if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
+        return success;
+    }
+    document.querySelectorAll('.ach-history-copy').forEach(function (button) {
+        button.addEventListener('click', function () {
+            var value = button.getAttribute('data-copy-url');
+            var label = button.getAttribute('aria-label').replace(/^Copy /, '');
+            function report(success) {
+                if (status) status.textContent = success
+                    ? label + ' copied.'
+                    : 'Copy unavailable. Inspect this link in YOURLS link management.';
+            }
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(value).then(
+                    function () { report(true); },
+                    function () { report(legacyCopy(value)); }
+                );
+            } else {
+                report(legacyCopy(value));
+            }
+        });
+    });
+})();
+</script>
+HTML;
+}
+
 /** Show an explicit irreversible-action confirmation, but do not delete yet. */
 function ach_url_guard_history_confirmation(
     array $row,
@@ -48,9 +152,18 @@ function ach_url_guard_history_confirmation(
     string $scope,
     array $settings
 ): void {
-    echo '<section aria-label="Review link deletion" style="border:1px solid #ccc;padding:1em;margin:1em 0;">';
+    echo '<section class="ach-history-confirm" aria-label="Review link deletion">';
     echo '<h3>Review before permanent deletion</h3>';
-    echo '<p>Short keyword: <strong>' . ach_url_guard_esc($row['keyword']) . '</strong></p>';
+    echo '<p>Short keyword: <code class="ach-history-one-line" dir="ltr" title="'
+        . ach_url_guard_esc((string) $row['keyword']) . '">'
+        . ach_url_guard_history_compact_html((string) $row['keyword'], 66)
+        . '</code></p>';
+    ach_url_guard_history_url_field('Full short URL', yourls_link((string) $row['keyword']));
+    ach_url_guard_history_url_field('Full destination URL', (string) $row['url']);
+    echo '<p id="ach-history-copy-status" role="status" aria-live="polite"></p>';
+    echo '<p><small>Full URLs are shown only for this individually reviewed link.'
+        . ' Destination URLs may contain private query tokens. Copy to inspect;'
+        . ' neither address is opened by this page.</small></p>';
     echo '<p>Destination host: <strong>'
         . ach_url_guard_esc(HistoricalReview::hostLabel((string) $row['url'])) . '</strong></p>';
     echo '<p>Reason: <strong>' . ach_url_guard_esc(ach_url_guard_history_reason_label((string) $verdict['reason']))
@@ -74,6 +187,7 @@ function ach_url_guard_history_confirmation(
         . '<a href="' . ach_url_guard_esc(yourls_admin_url('plugins.php?page=ach_url_guard_history'))
         . '">Cancel</a></p>';
     echo '</form></section>';
+    ach_url_guard_history_copy_script();
 }
 
 /** Registered by YOURLS under /admin/plugins.php?page=ach_url_guard_history. */
@@ -145,6 +259,26 @@ function ach_url_guard_history_page(): void
     }
 
     echo '<main role="main" style="max-width:1050px;margin:2em auto;">';
+    echo <<<'HTML'
+<style>
+.ach-history-confirm { box-sizing:border-box;max-width:100%;overflow:hidden;border:1px solid #ccc;padding:1em;margin:1em 0; }
+.ach-history-url-field { display:grid;grid-template-columns:9rem minmax(0,1fr) auto;align-items:center;gap:.5em 1em;margin:.6em 0;min-width:0; }
+.ach-history-one-line { display:inline-flex;box-sizing:border-box;max-width:100%;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;unicode-bidi:isolate; }
+.ach-history-prefix { flex:0 1 auto;min-width:0;overflow:hidden;white-space:nowrap; }
+.ach-history-marker,.ach-history-suffix { flex:0 0 auto;white-space:nowrap; }
+.ach-history-url-field .ach-history-one-line { display:flex; }
+.ach-history-copy { white-space:nowrap; }
+.ach-history-table { width:100%;min-width:760px;table-layout:fixed; }
+.ach-history-table th,.ach-history-table td { vertical-align:top; }
+.ach-history-keyword { min-width:0;overflow:hidden; }
+.ach-history-keyword .ach-history-one-line { display:flex;width:100%; }
+@media (max-width:650px) {
+    .ach-history-url-field { grid-template-columns:minmax(0,1fr) auto; }
+    .ach-history-url-field strong { grid-column:1 / -1; }
+}
+</style>
+HTML;
+
     echo '<h2>ACh URL Guard — Historical Link Review</h2>';
     echo '<p><a href="' . ach_url_guard_esc(yourls_admin_url('plugins.php?page=ach_url_guard'))
         . '">Guard settings</a></p>';
@@ -197,13 +331,18 @@ function ach_url_guard_history_page(): void
         echo '<p>Showing ' . count($page['rows']) . ' existing links in this batch.'
             . ' All rows are displayed so links without a local-policy match can be HTTP-checked individually.'
             . '</p>';
-        echo '<div style="overflow-x:auto"><table class="tbl" style="width:100%;">';
+        echo '<div style="overflow-x:auto;max-width:100%"><table class="tbl ach-history-table">';
+        echo '<colgroup><col style="width:8%"><col style="width:36%"><col style="width:17%">'
+            . '<col style="width:23%"><col style="width:6%"><col style="width:10%"></colgroup>';
         echo '<thead><tr><th><label><input type="checkbox" id="ach-history-select-all" />' . ' Select all visible</label></th><th>Short keyword</th><th>Destination host</th>'
             . '<th>Local policy result</th><th>Clicks</th><th>Action</th></tr></thead><tbody>';
         foreach ($page['rows'] as $row) {
             $verdict = HistoricalReview::inspect($row, $settings);
             $flagged = $verdict['status'] === 'deny';
-            echo '<tr><td><input type="checkbox" class="ach-history-select"' . ' name="bulk_keywords[]" form="ach-bulk-create" value="' . ach_url_guard_esc((string) $row['keyword']) . '" aria-label="Select ' . ach_url_guard_esc((string) $row['keyword']) . '" />' . '</td><td><code>' . ach_url_guard_esc((string) $row['keyword']) . '</code></td>';
+            echo '<tr><td><input type="checkbox" class="ach-history-select"' . ' name="bulk_keywords[]" form="ach-bulk-create" value="' . ach_url_guard_esc((string) $row['keyword']) . '" aria-label="Select ' . ach_url_guard_esc((string) $row['keyword']) . '" />' . '</td><td class="ach-history-keyword"><code class="ach-history-one-line" dir="ltr" title="'
+                . ach_url_guard_esc((string) $row['keyword']) . '">'
+                . ach_url_guard_history_compact_html((string) $row['keyword'], 46)
+                . '</code></td>';
             echo '<td>' . ach_url_guard_esc(HistoricalReview::hostLabel((string) $row['url'])) . '</td>';
             echo '<td>' . ach_url_guard_esc(ach_url_guard_history_reason_label((string) $verdict['reason']));
             if ($flagged) {

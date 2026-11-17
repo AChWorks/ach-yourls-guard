@@ -55,6 +55,11 @@ redirects and customer data.
   plugin table, plus small owner-bound progress records in YOURLS options.
   Require a typed count and checkbox to confirm permanent deletion; support
   restartable keyset batches, stop, progress and saved resume link.
+- On explicit single-link review by an authenticated admin, show full short and
+  destination URLs (which may include private query tokens) as inert text,
+  abbreviating long display labels in one line with `[...]`. Provide full-value
+  Copy without fetching the destination. Keep full destinations absent from the
+  default review table, bulk snapshots, reports and ordinary logs.
 - Recheck each candidate's exact stored row, effective policy, reason, filter
   and CSRF authorization before native YOURLS deletion. Skip changed, healthy
   or unknown candidates and never substitute later links for snapshotted
