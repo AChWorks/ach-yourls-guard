@@ -286,6 +286,12 @@ $expect(yourls_insert_link_in_db('https://bad.example/private?token=DO_NOT_RENDE
     $historyName, 'History-only test record'), 'A flagged test-owned record must be inserted.');
 $marked = \ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName);
 $expect($marked !== null, 'Historical lookup retrieves the exact fixture row.');
+$_SERVER['REQUEST_METHOD'] = 'GET';
+$_GET = ['keyword' => $historyName];
+ob_start(); ach_url_guard_history_page(); $exactListHtml = ob_get_clean();
+$expect(str_contains($exactListHtml, $historyName) && !str_contains($exactListHtml, 'DO_NOT_RENDER'),
+    'Exact-keyword GET review list hides destination query tokens before individual review.');
+$_GET = [];
 $expect(\ACh\Yourls\UrlGuard\HistoricalReview::inspect($marked, $historyPolicy)['reason']
     === 'blocked_domain', 'Current local Guard policy flags fixture row.');
 $reviewProof = \ACh\Yourls\UrlGuard\HistoricalReview::proof($marked, $historyPolicy);
@@ -297,8 +303,15 @@ $_POST = [
 ob_start(); ach_url_guard_history_page(); $confirmationHTML = ob_get_clean();
 $expect(str_contains($confirmationHTML, 'Delete this short link permanently'),
     'Real YOURLS nonce and admin review render a confirmation form.');
-$expect(!str_contains($confirmationHTML, 'DO_NOT_RENDER'),
-    'Review confirmation hides URL query tokens.');
+$expect(str_contains($confirmationHTML,
+    'data-copy-url="https://bad.example/private?token=DO_NOT_RENDER"'),
+    'Exact, authenticated confirmation exposes full original destination only for Copy.');
+$expect(str_contains($confirmationHTML,
+    'data-copy-url="' . ach_url_guard_esc(yourls_link($historyName)) . '"'),
+    'Exact, authenticated confirmation offers the native full short URL for Copy.');
+$expect(!str_contains($confirmationHTML, 'href="https://bad.example/')
+    && !str_contains($confirmationHTML, 'src="https://bad.example/'),
+    'Destination remains inert text with no outbound fetch or auto-navigation.');
 $expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName) !== null,
     'Review form must not delete a link.');
 

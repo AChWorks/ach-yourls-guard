@@ -92,6 +92,7 @@ function yourls_verify_nonce($action, $nonce = false): bool {
     return true;
 }
 function yourls_admin_url($path = ''): string {return 'https://short.example/admin/' . $path;}
+function yourls_link($keyword = ''): string {return 'https://short.example/' . rawurlencode((string) $keyword);}
 $historyAuthenticated = true;
 function yourls_is_valid_user(): bool { global $historyAuthenticated; return $historyAuthenticated; }
 function yourls_die($message, $title = '', $status = 403): void { throw new RuntimeException('Authentication denied (' . $status . ')'); }
@@ -160,6 +161,55 @@ check(HistoricalReview::inspect($overBudget, $strictUnknown)['reason'] === 'rege
     'unknown review preserves diagnostic reason even in strict deny mode');
 check(HistoricalReview::inspect($db->rows['long-generated-name-1234567890'], $settings)['status'] === 'allow',
     'historical generated/unknown-length alias not condemned by custom cap');
+$display = ach_url_guard_history_compact('https://example.org/start/'
+    . str_repeat('x', 140) . '/finish?key=LAST', 64);
+check(str_starts_with($display, 'https://example.org/') && str_contains($display, '[...]')
+    && str_ends_with($display, 'LAST') && strlen($display) === 64,
+    'long URL shows start and end with middle omission');
+$bracketUrl = 'https://example.org/[...]?q=' . str_repeat('a', 180) . '&end=TAIL';
+$bracketHtml = ach_url_guard_history_compact_html($bracketUrl, 55);
+check(substr_count($bracketHtml, 'class="ach-history-marker"') === 1
+    && str_contains($bracketHtml, 'ach-history-suffix')
+    && str_contains($bracketHtml, 'TAIL'),
+    'pre-existing literal [...] does not confuse or hide the actual omission marker');
+$mobileParts = ach_url_guard_history_compact_parts(str_repeat('z', 500), 80);
+check($mobileParts['truncated'] && strlen($mobileParts['tail']) <= 10
+    && strlen($mobileParts['head']) > 0,
+    'narrow mobile value keeps a compact exact suffix and visible start');
+$mediumValue = 'https://example.org/' . str_repeat('abcde', 10);
+$mediumCode = ach_url_guard_history_code($mediumValue, 80);
+check(strlen($mediumValue) < 80
+    && str_contains($mediumCode, 'class="ach-history-one-line"')
+    && str_contains($mediumCode, 'class="ach-history-compact" aria-hidden="true"')
+    && str_contains($mediumCode, 'class="ach-history-marker"'),
+    'medium-length value has a hidden compact alternative for width-dependent overflow');
+$unicodeValue = 'https://example.org/' . str_repeat('路径', 10);
+$unicodeCode = ach_url_guard_history_code($unicodeValue);
+check(str_contains($unicodeCode, 'ach-history-original')
+    && str_contains($unicodeCode, 'ach-history-compact')
+    && str_contains($unicodeCode, 'middle omitted'),
+    'Unicode text has both original and accessible abbreviated alternatives');
+ob_start();
+ach_url_guard_history_responsive_script();
+$responsiveScript = ob_get_clean();
+check(str_contains($responsiveScript, 'getBoundingClientRect().width > code.clientWidth')
+    && str_contains($responsiveScript, 'ResizeObserver')
+    && str_contains($responsiveScript, 'Intl.Segmenter'),
+    'rendered-width and grapheme-aware abbreviation is initialized with resize observation');
+check(str_contains($responsiveScript, 'original.setAttribute')
+    && str_contains($responsiveScript, 'compact.setAttribute')
+    && str_contains($responsiveScript, 'suffix.textContent'),
+    'accessible compact state and exact untrusted suffix use safe text assignment');
+check(ach_url_guard_history_compact('https://example.org/') === 'https://example.org/',
+    'short URL remains unchanged in display');
+check(str_contains(ach_url_guard_history_compact(str_repeat('مسیر', 40), 22), '[...]'),
+    'UTF-8 multibyte labels abbreviate without breaking a character');
+ob_start();
+ach_url_guard_history_url_field('Full destination URL', 'https://example.org/?x="><img src=x onerror=alert(1)>&secret=a');
+$unsafeField = ob_get_clean();
+check(!str_contains($unsafeField, '<img') && !str_contains($unsafeField, 'onerror=alert(1)>')
+    && str_contains($unsafeField, '&quot;') && str_contains($unsafeField, '&amp;secret=a'),
+    'copy attribute and visible URL label escape attacker-controlled text');
 check(HistoricalReview::hostLabel($db->rows['bad']['url']) === 'bit.ly', 'host summary only');
 check(HistoricalReview::hostLabel('not a url') === '[invalid destination]', 'invalid host redacted');
 check(HistoricalReview::pageSize('1000') === 50, 'unbounded batch sizes reset to documented default');
@@ -173,6 +223,16 @@ $_GET = [];
 $_POST = [];
 ob_start();ach_url_guard_history_page();$html = ob_get_clean();
 check(str_contains($html, 'Review deletion'), 'definitely flagged rows provide review');
+check(str_contains($html, 'ach-history-original')
+    && str_contains($html, 'ach-history-compact')
+    && str_contains($html, 'getBoundingClientRect().width > code.clientWidth'),
+    'normal admin page includes responsive abbreviation markup and working resize script');
+
+check(str_contains($html, 'ach-history-table') && str_contains($html, 'white-space:nowrap')
+    && str_contains($html, 'text-overflow:ellipsis'),
+    'list retains single-line compact values and bounded responsive columns');
+check(!str_contains($html, 'data-copy-url='),
+    'default review table never embeds a full destination for copying');
 check(str_contains($html, 'Select all visible'), 'visible-page Select All checkbox rendered');
 check(str_contains($html, 'Select All Matching Filters across every page'),
     'cross-page filtered selection clearly labeled');
@@ -241,7 +301,24 @@ $_POST = [
 ];
 ob_start();ach_url_guard_history_page();$reviewHtml=ob_get_clean();
 check(str_contains($reviewHtml, 'Delete this short link permanently'), 'two-step confirmation rendered');
-check(!str_contains($reviewHtml, 'NEVER_SHOW'), 'confirmation does not reveal query token');
+check(str_contains($reviewHtml, 'Full short URL')
+    && str_contains($reviewHtml, 'data-copy-url="https://short.example/bad"')
+    && str_contains($reviewHtml, 'Full destination URL'),
+    'exact reviewed link and original destination presented before deletion');
+check(str_contains($reviewHtml, 'data-copy-url="https://bit.ly/private?api_key=NEVER_SHOW"'),
+    'explicit single-link confirmation offers full destination to Copy');
+check(!str_contains($reviewHtml, 'href="https://bit.ly/')
+    && !str_contains($reviewHtml, 'src="https://bit.ly/')
+    && !str_contains($reviewHtml, 'href="https://short.example/bad"'),
+    'untrusted destination is text/copy only, not a navigable or fetched resource');
+check(str_contains(ach_url_guard_history_compact_html(str_repeat('a', 180), 40),
+    'class="ach-history-marker"') && str_contains($reviewHtml, 'ach-history-copy'),
+    'abbreviation marker remains an explicit fixed-size element');
+check(!str_contains($reviewHtml, 'aria-label="Full destination URL: '),
+    'private full destination is not duplicated in assistive labels');
+check(str_contains($reviewHtml, 'navigator.clipboard.writeText')
+    && str_contains($reviewHtml, 'document.execCommand'),
+    'copy implementation supports secure Clipboard API and browser fallback');
 check($db->deletes === 0, 'review action is not deletion');
 
 $_POST = [

@@ -3,7 +3,7 @@
 Plugin Name: ACh URL Guard
 Plugin URI: https://github.com/AChWorks/ach-yourls-guard
 Description: Safe new-link policy enforcement and an optional admin-only manual review of historical short links.
-Version: 0.2.0
+Version: 0.2.1
 Author: ACh
 */
 
@@ -162,6 +162,11 @@ function ach_url_guard_require_admin(): void
     if (yourls_is_valid_user() !== true) {
         yourls_die('Admin login required to manage ACh URL Guard.', 'Access denied', 403);
         exit;
+    }
+    // The historical confirmation can contain query credentials. Set the
+    // admin-only cache policy at the pre-render load hook, before page output.
+    if (!headers_sent()) {
+        header('Cache-Control: private, no-store, max-age=0', true);
     }
 }
 
