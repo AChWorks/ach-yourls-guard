@@ -63,8 +63,8 @@ final class HistoricalReview
     }
 
     /**
-     * The custom alias cap applies to new *custom* aliases, not historical
-     * generated aliases. Deliberately ignore that cap for old-link review.
+     * Custom alias length limits apply to new *custom* aliases, not historical
+     * or generated aliases. Ignore BOTH min and max in old-link review.
      * Network checks are opt-in and never contact reputation vendors.
      */
     public static function inspect(array $row, array $settings, bool $network = false, ?callable $networkCheck = null): array
@@ -76,6 +76,7 @@ final class HistoricalReview
             return $local;
         }
         $aliasSettings = $settings;
+        $aliasSettings['min_custom_keyword_length'] = 0;
         $aliasSettings['max_custom_keyword_length'] = 0;
         $alias = Policy::inspectKeyword((string) $row['keyword'], $aliasSettings);
         if ($alias['status'] === 'deny') {

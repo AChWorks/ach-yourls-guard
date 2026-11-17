@@ -29,6 +29,7 @@ function status(string $url, array $settings): string
 }
 $settings = Policy::settings([]);
 eq('monitor', $settings['mode'], 'default mode must not block URL policies');
+eq(0, $settings['min_custom_keyword_length'], 'minimum disabled on existing installations by default');
 eq(20, $settings['max_custom_keyword_length'], 'default custom short keyword cap');
 eq(['.bit.ly', '.tinyurl.com', '.cutt.ly', '.is.gd'], $settings['blocked_domains'], 'editable shortener-chain starter list');
 eq('blocked_domain', status('https://sub.bit.ly/path', $settings), 'starter list matches an existing shortening service');
@@ -91,6 +92,21 @@ eq('keyword_pass', Policy::inspectKeyword('supporter', $filters)['reason'], 'res
 eq('keyword_too_long', Policy::inspectKeyword(str_repeat('ژ', 21), $filters)['reason'], 'UTF-8 characters counted, not bytes');
 $filters['max_custom_keyword_length'] = 0;
 eq('keyword_pass', Policy::inspectKeyword('abcdefghijklmnopqrstu', $filters)['reason'], 'operator disables cap with 0');
+$minimumFilters = Policy::settings(['min_custom_keyword_length' => 5, 'max_custom_keyword_length' => 20]);
+eq('keyword_too_short', Policy::inspectKeyword('abcd', $minimumFilters)['reason'], 'custom alias below minimum rejected');
+eq('keyword_pass', Policy::inspectKeyword('abcde', $minimumFilters)['reason'], 'five-character minimum is inclusive');
+eq('keyword_pass', Policy::inspectKeyword('', $minimumFilters)['reason'], 'no submitted custom alias bypasses minimum');
+eq('keyword_too_short', Policy::inspectKeyword(str_repeat('ژ', 4), $minimumFilters)['reason'],
+    'minimum counts UTF-8 characters and not encoded bytes');
+eq('keyword_pass', Policy::inspectKeyword(str_repeat('ژ', 5), $minimumFilters)['reason'],
+    'five UTF-8 characters satisfy the minimum');
+$minimumFilters['max_custom_keyword_length'] = 0;
+eq('keyword_pass', Policy::inspectKeyword(str_repeat('x', 50), $minimumFilters)['reason'],
+    'unbounded maximum is compatible with an enabled minimum');
+$minimumFilters['min_custom_keyword_length'] = 0;
+eq('keyword_pass', Policy::inspectKeyword('a', $minimumFilters)['reason'], 'zero disables minimum');
+eq(0, Policy::settings(['min_custom_keyword_length' => '-1'])['min_custom_keyword_length'],
+    'corrupt negative minimum is normalized to disabled');
 $broken = Policy::settings(['block_root_urls' => false, 'blocked_domains' => [], 'blocked_url_patterns' => '/[broken/']);
 eq('regex_unavailable', status('https://example.com/p', $broken), 'corrupted stored regex is visible as unknown');
 $broken['unknown_action'] = 'deny';
@@ -345,20 +361,37 @@ $limitFail = ach_url_guard_on_create($sentinel, 'https://example.com/valid-page'
 eq('error:ach_url_guard:keyword_too_long', $limitFail['code'], 'length cap enforced in Monitor');
 eq('400', $limitFail['errorCode'], 'alias length failure uses HTTP 400');
 eq($sentinel, ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'abcdefghijklmnopqrst'), 'exactly 20 characters allowed');
+$fakeOptions['ach_url_guard_settings']['min_custom_keyword_length'] = 5;
+$minFail = ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'abcd');
+eq('error:ach_url_guard:keyword_too_short', $minFail['code'], 'minimum enforced even in Monitor');
+eq('400', $minFail['statusCode'], 'too-short custom alias uses HTTP 400');
+eq(true, str_contains($minFail['message'], 'at least 5'), 'too-short alias has clear message');
+eq($sentinel, ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'abcde'),
+    'exactly five characters allowed by new minimum');
+eq($sentinel, ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', ''),
+    'generated alias path unchanged by minimum');
 $fakeOptions['ach_url_guard_settings']['blocked_short_keywords'] = ['support'];
 eq($sentinel, ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'SUPPORT'), 'Monitor does not block reserved alias');
 $fakeOptions['ach_url_guard_settings']['mode'] = 'enforce';
+eq('error:ach_url_guard:keyword_too_short',
+    ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'abcd')['code'],
+    'minimum enforced in Enforce mode');
 $blockedShort = ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'SUPPORT');
 eq('error:ach_url_guard:blocked_short_keyword', $blockedShort['code'], 'Enforce rejects reserved alias');
 $fakeOptions['ach_url_guard_settings']['max_custom_keyword_length'] = 0;
 eq($sentinel, ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'abcdefghijklmnopqrstu'), '0 turns off the alias cap');
+$fakeOptions['ach_url_guard_settings']['min_custom_keyword_length'] = 0;
+eq($sentinel, ach_url_guard_on_create($sentinel, 'https://example.com/valid-page', 'abc'),
+    'zero minimum restores short custom aliases');
 $_SERVER['REQUEST_METHOD'] = 'GET';
 ob_start();
 ach_url_guard_admin_page();
 $adminHtml = ob_get_clean();
 eq(true, strpos($adminHtml, 'Monitor only') !== false, 'admin has monitor setting');
 eq(true, strpos($adminHtml, 'name="max_custom_keyword_length"') !== false,
-    'alias length cap visibly configurable in admin settings');
+    'alias maximum visibly configurable in admin settings');
+eq(true, strpos($adminHtml, 'name="min_custom_keyword_length"') !== false,
+    'alias minimum visibly configurable in admin settings');
 eq(true, strpos($adminHtml, 'Enforce: reject definite violations') !== false, 'admin has enforcement setting');
 eq(true, strpos($adminHtml, 'Web Risk API key:') !== false, 'admin displays key readiness');
 eq(true, strpos($adminHtml, 'Recent sampled decisions') !== false, 'admin shows audit evidence');
@@ -373,19 +406,85 @@ $_POST = ['ach_url_guard_save' => '1', 'nonce' => 'fake-test-nonce', 'mode' => '
 ob_start(); ach_url_guard_admin_page(); $badPatternHtml = ob_get_clean();
 eq(true, strpos($badPatternHtml, 'blocked_url_patterns') !== false, 'invalid regex shown, no settings saved');
 eq('enforce', $fakeOptions['ach_url_guard_settings']['mode'], 'invalid regex preserves previous settings');
+$previousSettings = $fakeOptions['ach_url_guard_settings'];
+$_POST['blocked_url_patterns'] = '~/(?:sale|offer)~i';
+$_POST['max_custom_keyword_length'] = '25';
+$_POST['min_custom_keyword_length'] = '26';
+ob_start(); ach_url_guard_admin_page(); $badRange = ob_get_clean();
+eq(true, str_contains($badRange, 'cannot exceed the enabled maximum'),
+    'admin rejects minimum greater than enabled maximum');
+eq($previousSettings, $fakeOptions['ach_url_guard_settings'],
+    'rejected range does not partially save settings');
+$_POST['min_custom_keyword_length'] = '-1';
+ob_start(); ach_url_guard_admin_page(); $badNegative = ob_get_clean();
+eq(true, str_contains($badNegative, 'must be a nonnegative integer'),
+    'admin rejects negative minimum');
+eq($previousSettings, $fakeOptions['ach_url_guard_settings'],
+    'invalid minimum keeps previous stored policy');
 $_POST = ['ach_url_guard_save' => '1', 'nonce' => 'fake-test-nonce', 'mode' => 'monitor',
     'blocked_domains' => '.Bad.Example', 'root_exceptions' => '', 'dnsbl_zones' => '',
     'blocked_url_terms' => 'casino', 'blocked_url_patterns' => '~/(?:sale|offer)~i',
-    'blocked_short_keywords' => 'SUPPORT', 'max_custom_keyword_length' => '25'];
+    'blocked_short_keywords' => 'SUPPORT', 'min_custom_keyword_length' => '5',
+    'max_custom_keyword_length' => '25'];
 ob_start(); ach_url_guard_admin_page(); $okHtml = ob_get_clean();
 eq(true, strpos($okHtml, 'Settings saved') !== false, 'admin saves valid rules');
 eq('fake-test-nonce', $lastNonce, 'admin passes explicit POST nonce to YOURLS verifier');
 eq(['.bad.example'], $fakeOptions['ach_url_guard_settings']['blocked_domains'], 'stored rule canonicalized');
+eq(5, $fakeOptions['ach_url_guard_settings']['min_custom_keyword_length'], 'minimum alias length saved from admin');
 eq(25, $fakeOptions['ach_url_guard_settings']['max_custom_keyword_length'], 'max alias length saved from admin');
 eq(['casino'], $fakeOptions['ach_url_guard_settings']['blocked_url_terms'], 'URL phrases saved from admin');
 eq(['~/(?:sale|offer)~i'], $fakeOptions['ach_url_guard_settings']['blocked_url_patterns'], 'PCRE patterns saved from admin');
 eq(['SUPPORT'], $fakeOptions['ach_url_guard_settings']['blocked_short_keywords'], 'reserved aliases saved from admin');
+$_POST['max_custom_keyword_length'] = '0';
+ob_start(); ach_url_guard_admin_page(); $noMaxHtml = ob_get_clean();
+eq(true, str_contains($noMaxHtml, 'Settings saved.'),
+    'admin accepts an enabled minimum with maximum disabled');
+eq(5, $fakeOptions['ach_url_guard_settings']['min_custom_keyword_length'],
+    'minimum persists with an unbounded maximum');
+eq(0, $fakeOptions['ach_url_guard_settings']['max_custom_keyword_length'],
+    'administrator can disable maximum independently of minimum');
 
+// A malformed authenticated form must not silently reset an existing policy
+// or partially apply other valid fields from that same POST.
+$originalForm = $_POST;
+$originalStoredSettings = $fakeOptions['ach_url_guard_settings'];
+$invalidLengthCases = [
+    'minimum array' => ['min_custom_keyword_length', ['5'], false, 'must be a nonnegative integer'],
+    'maximum array' => ['max_custom_keyword_length', ['20'], false, 'must be a nonnegative integer'],
+    'nested minimum array' => ['min_custom_keyword_length', [['5']], false, 'must be a nonnegative integer'],
+    'missing minimum' => ['min_custom_keyword_length', null, true, 'required'],
+    'missing maximum' => ['max_custom_keyword_length', null, true, 'required'],
+    'null minimum' => ['min_custom_keyword_length', null, false, 'must be a nonnegative integer'],
+    'null maximum' => ['max_custom_keyword_length', null, false, 'must be a nonnegative integer'],
+    'empty minimum' => ['min_custom_keyword_length', '', false, 'must be a nonnegative integer'],
+    'empty maximum' => ['max_custom_keyword_length', '', false, 'must be a nonnegative integer'],
+    'nonnumeric minimum' => ['min_custom_keyword_length', 'abc', false, 'must be a nonnegative integer'],
+    'fraction maximum' => ['max_custom_keyword_length', '5.5', false, 'must be a nonnegative integer'],
+    'negative minimum' => ['min_custom_keyword_length', '-1', false, 'must be a nonnegative integer'],
+    'negative maximum' => ['max_custom_keyword_length', '-1', false, 'must be a nonnegative integer'],
+    'oversized minimum' => ['min_custom_keyword_length', '99999999999999999999999999999', false, 'must be a nonnegative integer'],
+    'oversized maximum' => ['max_custom_keyword_length', '99999999999999999999999999999', false, 'must be a nonnegative integer'],
+    'boolean minimum' => ['min_custom_keyword_length', true, false, 'must be a nonnegative integer'],
+    'minimum above maximum' => ['min_custom_keyword_length', '6', false, 'cannot exceed the enabled maximum'],
+];
+foreach ($invalidLengthCases as $case => [$field, $value, $missing, $message]) {
+    $_POST = $originalForm;
+    $_POST['mode'] = 'enforce'; // An otherwise valid setting must not partially apply.
+    $_POST['max_custom_keyword_length'] = '5';
+    if ($missing) {
+        unset($_POST[$field]);
+    } else {
+        $_POST[$field] = $value;
+    }
+    ob_start(); ach_url_guard_admin_page(); $invalidLengthHtml = ob_get_clean();
+    eq(true, str_contains($invalidLengthHtml, 'Invalid settings, nothing saved:'),
+        $case . ': explicit invalid-form feedback');
+    eq(true, str_contains($invalidLengthHtml, $field . ': ' . $message),
+        $case . ': field-specific error');
+    eq($originalStoredSettings, $fakeOptions['ach_url_guard_settings'],
+        $case . ': no partial setting write');
+}
+$_POST = $originalForm;
 
 // WorkGate shares a small anonymous file state across requests for optional
 // expensive checks. No customer URL or source IP may appear in those files.

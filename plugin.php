@@ -3,7 +3,7 @@
 Plugin Name: ACh URL Guard
 Plugin URI: https://github.com/AChWorks/ach-yourls-guard
 Description: Safe new-link policy enforcement and an optional admin-only manual review of historical short links.
-Version: 0.2.1
+Version: 0.2.2
 Author: ACh
 */
 
@@ -41,11 +41,18 @@ function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
         // aliases separately. Use the core sanitizer to count what would be saved.
         $normalizedKeyword = is_scalar($keyword) ? (string) $keyword : '';
         if ($normalizedKeyword !== '') {
+            // Force Lowercase installs its custom-keyword sanitizer only AFTER
+            // shunt_add_new_link runs. Match its already-loaded ASCII case
+            // normalization before measuring length; do not change the actual
+            // keyword handed to YOURLS or invoke its native action prematurely.
+            if (function_exists('ozh_break_the_web_lowercase')) {
+                $normalizedKeyword = ozh_break_the_web_lowercase($normalizedKeyword);
+            }
             $normalizedKeyword = yourls_sanitize_keyword($normalizedKeyword, true);
         }
         $keywordPolicy = Policy::inspectKeyword($normalizedKeyword, $settings);
-        if ($keywordPolicy['reason'] === 'keyword_too_long') {
-            // Deterministic input limit is independent of URL safety Monitor mode.
+        if (in_array($keywordPolicy['reason'], ['keyword_too_short', 'keyword_too_long'], true)) {
+            // Deterministic custom-alias bounds apply in Monitor AND Enforce.
             $result = $keywordPolicy;
         } else {
             // Deterministic local denies remain enforceable even when costly
@@ -73,7 +80,7 @@ function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
     if ($result['status'] !== 'allow') {
         ach_url_guard_record_event($normalizedUrl, $result, $settings);
     }
-    if (($result['reason'] ?? '') !== 'keyword_too_long' &&
+    if (!in_array(($result['reason'] ?? ''), ['keyword_too_short', 'keyword_too_long'], true) &&
         ($settings['mode'] !== 'enforce' || $result['status'] !== 'deny')) {
         // Identity return is essential: YOURLS shunts on *any* other value.
         return $original;
@@ -84,6 +91,8 @@ function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
         'blocked_url_term' => 'This destination contains a prohibited phrase.',
         'blocked_url_pattern' => 'This destination matches a prohibited URL rule.',
         'blocked_short_keyword' => 'This custom short keyword is reserved.',
+        'keyword_too_short' => 'Custom short keyword must contain at least ' .
+            $settings['min_custom_keyword_length'] . ' characters.',
         'keyword_too_long' => 'Custom short keyword exceeds the configured maximum of ' .
             $settings['max_custom_keyword_length'] . ' characters.',
         'regex_unavailable' => 'A URL rule could not be evaluated.',
@@ -100,7 +109,8 @@ function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
     $reason = (string) ($result['reason'] ?? 'invalid_url');
     $isTransient = in_array($reason, ['unverifiable_destination', 'guard_unavailable', 'regex_unavailable',
         'work_control_unavailable', 'work_deferred'], true);
-    $code = $reason === 'keyword_too_long' ? '400' : ($isTransient ? '503' : '403');
+    $code = in_array($reason, ['keyword_too_short', 'keyword_too_long'], true)
+        ? '400' : ($isTransient ? '503' : '403');
     return [
         'status' => 'fail',
         'code' => 'error:ach_url_guard:' . $reason,
@@ -189,7 +199,7 @@ function ach_url_guard_admin_page(): void
     if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['ach_url_guard_save'])) {
         yourls_verify_nonce('ach_url_guard_settings', isset($_POST['nonce']) && is_string($_POST['nonce']) ? $_POST['nonce'] : '');
         $raw = [];
-        foreach (['mode', 'unknown_action', 'connect_timeout_seconds', 'request_timeout_seconds', 'max_redirects', 'recent_event_count', 'max_custom_keyword_length'] as $name) {
+        foreach (['mode', 'unknown_action', 'connect_timeout_seconds', 'request_timeout_seconds', 'max_redirects', 'recent_event_count'] as $name) {
             if (isset($_POST[$name]) && is_scalar($_POST[$name])) {
                 $raw[$name] = $_POST[$name];
             }
@@ -224,10 +234,29 @@ function ach_url_guard_admin_page(): void
                 $errors[] = 'blocked_short_keywords: ' . $shortKeyword;
             }
         }
-        if (isset($raw['max_custom_keyword_length']) &&
-            (filter_var($raw['max_custom_keyword_length'], FILTER_VALIDATE_INT) === false ||
-                (int) $raw['max_custom_keyword_length'] < 0)) {
-            $errors[] = 'max_custom_keyword_length: must be a nonnegative integer';
+        // Both numeric controls are always posted by this form. Missing or
+        // non-scalar fields must be rejected, not silently defaulted: that
+        // would overwrite a previously configured policy on an invalid POST.
+        foreach (['min_custom_keyword_length', 'max_custom_keyword_length'] as $field) {
+            if (!array_key_exists($field, $_POST)) {
+                $errors[] = $field . ': required';
+                continue;
+            }
+            $value = $_POST[$field];
+            if ((!is_string($value) && !is_int($value)) ||
+                filter_var($value, FILTER_VALIDATE_INT) === false ||
+                (int) $value < 0) {
+                $errors[] = $field . ': must be a nonnegative integer';
+                continue;
+            }
+            $raw[$field] = $value;
+        }
+        if ($errors === []) {
+            $minimum = (int) $raw['min_custom_keyword_length'];
+            $maximum = (int) $raw['max_custom_keyword_length'];
+            if ($maximum > 0 && $minimum > $maximum) {
+                $errors[] = 'min_custom_keyword_length: cannot exceed the enabled maximum';
+            }
         }
         if ($errors !== []) {
             $feedback = 'Invalid settings, nothing saved: ' . implode('; ', $errors);
@@ -258,11 +287,15 @@ function ach_url_guard_admin_page(): void
         echo '<option value="' . $value . '"' . ($settings['mode'] === $value ? ' selected' : '') . '>' . ach_url_guard_esc($label) . '</option>';
     }
     echo '</select></label></p>';
-    echo '<p><small>Monitor reports destination safety decisions without blocking them. The custom short keyword length limit applies in both modes.</small></p>';
+    echo '<p><small>Monitor reports destination safety decisions without blocking them. Custom short keyword minimum and maximum limits apply in both modes.</small></p>';
+    echo '<p><label><strong>Minimum custom short keyword characters:</strong> ';
+    echo '<input type="number" name="min_custom_keyword_length" min="0" value="' .
+        ach_url_guard_esc($settings['min_custom_keyword_length']) . '" /></label>';
+    echo '<br /><small>0 by default (disabled). Set 5 to require at least five characters for newly submitted custom aliases. Generated and existing aliases are unaffected.</small></p>';
     echo '<p><label><strong>Maximum custom short keyword characters:</strong> ';
     echo '<input type="number" name="max_custom_keyword_length" min="0" value="' .
         ach_url_guard_esc($settings['max_custom_keyword_length']) . '" /></label>';
-    echo '<br /><small>20 by default. 0 disables this limit; excludes domain, destination URL and generated aliases.</small></p>';
+    echo '<br /><small>20 by default. 0 disables the maximum; if enabled, it must be greater than or equal to the minimum. Destination URL, domain and generated aliases are unaffected.</small></p>';
     foreach ([
         'block_root_urls' => 'Disallow homepage-only destinations (including /?query=...)',
         'reachability_enabled' => 'Check destination HTTP status and each redirect hop',

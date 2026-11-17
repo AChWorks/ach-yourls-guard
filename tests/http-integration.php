@@ -85,6 +85,7 @@ foreach ([
     ['https://example.com/casino/slot', 'http-term', 'blocked_url_term', 403],
     ['https://example.com/OFFER/2026', 'http-regex', 'blocked_url_pattern', 403],
     ['https://example.com/safe', 'reserved', 'blocked_short_keyword', 403],
+    ['https://example.com/safe', 'four', 'keyword_too_short', 400],
     ['https://example.com/safe', 'abcdefghijklmnopqrstu', 'keyword_too_long', 400],
 ] as [$url, $keyword, $reason, $expectedHttp]) {
     [$httpCode, , $body] = $request('/yourls-api.php', $credentials + ['url' => $url, 'keyword' => $keyword]);
@@ -95,10 +96,28 @@ foreach ([
 }
 
 [$httpCode, , $body] = $request('/yourls-api.php', $credentials + [
+    'url' => 'https://example.com/HTTP/ExactMin', 'keyword' => 'five5',
+]);
+$exactMin = json_decode($body, true);
+$expect(is_array($exactMin) && ($exactMin['status'] ?? '') === 'success'
+    && ($exactMin['url']['keyword'] ?? '') === 'five5' && $httpCode === 200,
+    'Authenticated native HTTP API accepts a custom keyword exactly at minimum length.');
+
+[$httpCode, , $body] = $request('/yourls-api.php', $credentials + [
+    'url' => 'https://example.com/HTTP/UppercaseMinimum', 'keyword' => 'QWERT',
+]);
+$upperMinimum = json_decode($body, true);
+$expect(is_array($upperMinimum) && ($upperMinimum['status'] ?? '') === 'success'
+    && ($upperMinimum['url']['keyword'] ?? '') === 'qwert' && $httpCode === 200,
+    'Force Lowercase normalizes an all-uppercase five-character alias even before core keyword hooks.');
+
+[$httpCode, , $body] = $request('/yourls-api.php', $credentials + [
     'url' => 'https://example.com/HTTP/CaseSensitive?abc=XYZ', 'keyword' => 'HTTP-UPPER',
 ]);
 $allowed = json_decode($body, true);
-$expect(is_array($allowed) && ($allowed['status'] ?? '') === 'success', 'Authenticated HTTP API must create allowed destination, got HTTP ' . $httpCode);
+$expect(is_array($allowed) && ($allowed['status'] ?? '') === 'success',
+    'Authenticated HTTP API must create allowed destination, got HTTP ' . $httpCode
+    . ', API code ' . (string) ($allowed['code'] ?? 'missing'));
 $expect(($allowed['url']['keyword'] ?? '') === 'http-upper', 'Force Lowercase must affect keyword but not target path.');
 $expect($httpCode === 200, 'Allowed API request must return HTTP 200.');
 
