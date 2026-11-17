@@ -313,6 +313,9 @@ function yourls_sanitize_keyword($keyword, $restrict = false): string {
 function yourls_create_nonce($action): string {return 'fake-test-nonce';}
 function yourls_verify_nonce($action, $nonce = false): void {global $lastNonce; $lastNonce = $nonce;}
 function yourls_register_plugin_page($slug, $title, $function): void {}
+function yourls_admin_url($path = ''): string { return 'https://local.example/admin/' . $path; }
+function yourls_is_valid_user(): bool { return true; }
+function yourls_die($message, $title = '', $status = 403): void { throw new RuntimeException('Authentication denied'); }
 $nativeFloodChecks = 0;
 function yourls_check_IP_flood(string $ip = ''): bool {
     global $nativeFloodChecks;

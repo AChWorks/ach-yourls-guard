@@ -2,7 +2,7 @@
 
 An independent YOURLS plugin for safer creation of **new** short links. The implementation uses the supported `shunt_add_new_link` hook rather than modifying YOURLS core or depending on a fixed internal version. Validated with PHP 8.4/8.5 syntax and offline/cURL-contract tests, and against a disposable YOURLS 1.10.6 + MariaDB installation with real HTTP API, redirects and the three existing plugin types. Independent security review and authorized Production rollout remain separate delivery gates. See [project specification](docs/PROJECT-SPEC.md).
 
-**No existing short links are ever deleted, modified, blocked on redirect, or rewritten by this plugin.** It does not change existing user credentials, admin login, branding, `Random ShortURLs`, `Allow Hyphens`, or the YOURLS database schema.
+**Existing short links are never automatically deleted, modified, blocked on redirect or rewritten.** The authenticated admin page can remove a reviewed individual link **or a frozen set matching explicitly approved filters**. Filtered bulk deletion does not require reviewing each link individually, but requires a complete dry-run and explicit final confirmation. Starting bulk review creates one indexed candidate table plus small job records in YOURLS options. It does not alter YOURLS core schema, admin credentials, branding, or existing plugins.
 
 ## Features
 
@@ -16,7 +16,8 @@ An independent YOURLS plugin for safer creation of **new** short links. The impl
 - Optional **Google Web Risk Lookup** for malware, social engineering and unwanted software. Check original and intermediate/final redirected URLs. Requires an operator-supplied API key and billing-enabled Google Cloud project; does **not** attempt to create or provision a vendor account.
 - Optional domain DNSBL checking against operator-specified DNSBL zones, never deleting links or changing redirection behavior.
 - Simple YOURLS admin settings page with monitoring/enforcement, separate uncertainty handling, domain rules, network controls and recent sampled decision events (host/reason/URL hash only, no full URL or query tokens). Entries of the same reason and mode are sampled per UTC second across hosts, limiting repeated DB option writes in abusive traffic. Sampling is best-effort under concurrent requests and is not a complete audit trail.
-- A separate, read-only CLI tool to batch-audit historical links. Neither batch scanning nor ongoing scheduled checks are started automatically.
+- An admin-only historical review page with per-link HTTP checks, **Select all visible**, **Select all matching filters across all pages**, and manual single or explicitly confirmed bulk deletion. Bulk operations are keyset-paginated, restartable, and never delete new candidates outside the completed dry-run snapshot.
+- A separate, read-only CLI tool to batch-audit historical links, including optional network/provider checks. Neither batch scanning nor ongoing scheduled checks are started automatically.
 
 ## Defaults and production gate
 
@@ -44,7 +45,7 @@ The YOURLS admin page exposes three additional multiline inputs:
 - **Blocked destination URL patterns (Regex):** one complete PHP/PCRE pattern per line, including delimiters. Example: `~^https?://(?:[^/]+\.)?example\.com/ads(?:/|$)~i`. The entire URL and once-decoded URL are checked. Invalid regex syntax is rejected on save without partially updating the settings. Runtime evaluation temporarily caps PCRE backtracking to 10,000, recursion depth to 1,000 and evaluated input to 64 KiB per pattern, restoring PHP INI values afterward. Exceeding a budget is reported as `regex_unavailable` and follows the chosen `unknown_action`; it is **not** a general destination URL length limit. Patterns are an advanced trusted-admin option; overly broad rules can still reject legitimate links. Empty by default.
 - **Reserved custom short keywords:** one exact short alias per line, such as `support`. In Enforce, `lrl.li/support` is blocked, but `lrl.li/supporters` is not. The alias length cap is separate. Empty by default.
 
-Lines beginning with `#` are ignored as comments. All rules are local, editable, use no external API and only examine newly created links (and redirect hops when reachability checking is enabled). Existing links and redirect behavior are not altered.
+Lines beginning with `#` are ignored as comments. All rules are local, editable, use no external API and apply automatically only to newly created links (and reachable redirect hops when configured). The historical admin page can also inspect old links on demand. Existing redirects are unchanged unless an administrator manually confirms deletion of that exact link.
 
 ## Expensive-validation work admission
 
@@ -76,12 +77,34 @@ Google Safe Browsing API is restricted to non-commercial use; this package does 
 2. PHP syntax-check the package; inspect its file ownership and permissions.
 3. Enable **ACh URL Guard** from YOURLS **Manage Plugins**. Its default is monitoring; normal link creation and existing redirects must still work.
 4. Open **Plugins → ACh URL Guard**. Review the editable starter denylist, set the custom short alias cap (20 by default, 0 to disable), and optionally add local phrase/Regex/reserved alias rules. Review URL safety events in Monitor before selecting **Enforce**.
-5. Test representative allowed, root-only, blocked-domain, known 404, HTTPS and redirect cases, including an existing short link and administrator login.
-6. To roll back, deactivate the plugin through YOURLS or rename its directory if the admin page becomes unavailable. It does not mutate existing link records. Any persistent monitoring options may be retained without affecting the site.
+5. Test representative allowed, root-only, blocked-domain, known 404, HTTPS and redirect cases, including an existing short link and administrator login. For older links, open **Plugins → ACh URL Guard — Historical Review** to preview them without changing their targets.
+6. To roll back the Guard's automatic new-link policy, deactivate the plugin through YOURLS or rename its directory if the admin page becomes unavailable. Manual historical deletions, once explicitly confirmed, are **not** undone by deactivation; arrange your site's normal recoverable backups before using that feature. Any persistent monitoring options may be retained without affecting the site.
 
 **Do not deploy to a production host without the host owner's explicit approval for that exact operation.** In particular, enabling automatic rejections or an externally billed API is a separate policy decision from installing a plugin in monitor mode.
 
-## Inspect old links (read-only)
+## Review older links (admin page; manual deletion)
+
+Open **YOURLS admin → Plugins → ACh URL Guard — Historical Review** (also linked from Guard settings). This page shows a cursor-paginated, read-only evaluation of **every existing link in the selected page** against the *current* local destination and reserved-alias rules. A positive local match is a **review candidate**, not proof of malware; a homepage-only URL or a rule term could be legitimate. The default scan does not perform DNSBL, Web Risk or HTTP requests and does not record private query tokens in its HTML.
+
+For links with no definite local violation, **Check HTTP** performs a bounded GET/redirect/DNS/SSRF check and reports definite failure (HTTP 404/410) versus inconclusive outcomes (403/429/5xx, timeout). Explicit **HTTP 404/410**, **Private DNS address** and **Invalid redirect** bulk filters are supported, each requiring the same outbound HTTP/DNS consent checkbox. Each network-derived filter examines at most one link per request during preview and again before deletion; mixed private DNS answers are rejected before any HTTP connection, and invalid redirects are not followed. This can be slow for large selections; DNSBL and Web Risk are not used.
+
+Only definite violations offer **Review deletion** followed by an explicit confirmation checkbox and **Delete this short link permanently**. The selected row, authoritative stored policy and definite reason are rechecked under a database transaction immediately before deleting; changed or no-longer-flagged rows are preserved even if another administrator saved policy settings while a slow HTTP check was running. Deletion uses YOURLS's native function and therefore follows YOURLS's normal cache, hook, and click-log behavior. **There is no unapproved auto-delete, scheduled scan, redirect-time blocking, or restore button.** Reverting plugin settings/deactivating the plugin will not restore manually deleted links. Do not use the button without site-owner authorization and a tested recovery path.
+
+### Filtered bulk selection (large datasets)
+
+Use **Filter and select existing links**. Choose **Only checked rows on this page** (including the **Select all visible** checkbox), or **Select All Matching Filters across every page**. Filters: definite policy reason, any/zero/positive clicks, exact destination host, short-keyword prefix and created-before date. Unknown/uncertain results and historic/generated aliases exceeding the custom cap do not authorize deletion.
+
+**Preview** performs a restartable keyset dry-run in small requests, creating one indexed private candidate table that stores only job ID, exact keyword, HMAC row snapshot, definite reason and processing outcome. No plaintext destination paths or query tokens are saved in these candidate records. Per-job progress/cursor and owner identity are saved in YOURLS options. The completed preview shows the exact matched count. Before deletion, the admin must check a confirmation box and type **DELETE N**, where N is the displayed matched count. Only previously snapshotted candidates can be deleted; new records are never substituted. Each attempt rechecks the current link, original proof, stored policy, metadata filter and reason; changed, healthy, or unknown records are skipped. Even if a slow HTTP verification started when the link had **zero clicks**, a concurrent click before the URL row lock prevents deletion under the zero-click filter. Date, keyword prefix and host criteria are also rechecked under the row lock, without holding a lock during network I/O.
+
+Execution works in bounded batches while the browser is open, with progress and a bookmarkable resume link. **Pause automatic continuation** stops only the browser's next submission and can be resumed from the saved job; **Cancel job permanently** puts that job into a terminal cancelled state and cannot resume it. Closing the browser pauses further requests. Neither cancellation nor deactivation restores deletions already committed. Completed/cancelled/paused report metadata can be cleared separately without touching short URLs.
+
+**Network-derived bulk filters (HTTP 404/410, Private DNS address, Invalid redirect):** require explicit acknowledgment for outbound DNS/HTTP verification; check one destination per request during preview and again before deletion, with no DNSBL/Google API usage. It may require many browser requests for large datasets. The admin is responsible for deciding if a 404 is genuine; 403/429/5xx/timeouts and all other unknown results cannot authorize bulk removal.
+
+Use a tested backup and specific Production permission before permanent deletion. Native YOURLS delete hooks may have external effects not reversible by a database rollback. The job report does not store a full destination-URL export.
+
+Only destination **hostnames** are displayed in the review table; URL paths, embedded credentials and query values are never rendered by this page. The exact keyword lets an authorized operator inspect the intended link through existing YOURLS administration if more context is needed.
+
+## Inspect old links (read-only CLI)
 
 Run from the installed plugin path, using the private CLI session:
 
@@ -91,7 +114,7 @@ php bin/audit.php --site=/path/to/yourls --limit=200 --after=LAST_KEYWORD
 
 Options: `--network` checks HTTPS reachability; `--reputation` uses Google Web Risk if a key is configured. These flags can generate external requests/costs; without them it is purely a structural/domain-policy audit. Results are CSV on STDOUT; progress and next cursor go to STDERR. By default this scans a finite batch of 200, and the operator can choose their own batch size. Protect exported CSV because destination URL query strings may contain sensitive material.
 
-**No cron is installed; no existing URLs are automatically deleted or blocked.**
+**No cron is installed; no existing URLs are automatically deleted or blocked.** Historical deletion occurs only via a separately confirmed admin action.
 
 ## Tests
 
@@ -101,11 +124,13 @@ find src bin tests -name '*.php' -type f -exec php -l {} \;
 php tests/run.php
 php tests/curl-safety-contract.php
 php tests/workgate-concurrency.php
+php tests/history-review.php
+php tests/bulk-history.php
 YOURLS_SOURCE=/path/to/YOURLS-1.10.6 php tests/yourls-hook-contract.php
 YOURLS_SOURCE=/path/to/YOURLS-1.10.6 FORCE_LOWERCASE_SOURCE=/path/to/force-lowercase bash tests/db-integration.sh
 ```
 
-Coverage includes the default anti-chaining domain rules, custom alias cap in Monitor/Enforce and 0-disable behavior, local URL terms/Regex and reserved aliases, invalid admin-rule rejection and real HTTP API status checks, as well as root-only URLs, exact/wildcard rules, private/reserved addresses, numeric aliases, dangerous redirect targets, GET-only redirect validation, HTTP error handling, Google Web Risk and DNSBL mocks, unknown handling, and the YOURLS shunt/monitor/enforce contract. Network calls are mocked in the test harness, so no outside URLs are fetched. The cURL transport tests explicitly verify that failed option configuration never executes a network request and that DNS pinning, TLS and proxy restrictions are selected. The hook contract uses the actual upstream YOURLS filter implementation, without an active database. The separate database/HTTP integration test installs actual YOURLS 1.10.6 into a disposable MariaDB instance and isolated site, loads Random ShortURLs, Allow Hyphens, Force Lowercase and ACh URL Guard, verifies monitoring/enforcement, authenticated HTTP API allow/deny and HTTP status, existing/new redirect targets, protected admin settings, and compares a full database snapshot before/after the read-only historical audit. It never fetches an external test URL or points at Production.
+Coverage includes the default anti-chaining domain rules, custom alias cap in Monitor/Enforce and 0-disable behavior, local URL terms/Regex and reserved aliases, invalid admin-rule rejection and real HTTP API status checks, as well as root-only URLs, exact/wildcard rules, private/reserved addresses, numeric aliases, dangerous redirect targets, GET-only redirect validation, HTTP error handling, Google Web Risk and DNSBL mocks, unknown handling, and the YOURLS shunt/monitor/enforce contract. Network calls are mocked in the test harness, so no outside URLs are fetched. The cURL transport tests explicitly verify that failed option configuration never executes a network request and that DNS pinning, TLS and proxy restrictions are selected. The hook contract uses the actual upstream YOURLS filter implementation, without an active database. Additional historical review regressions verify paginated previews, non-secret HTML, stale-record/rule protection, nonce and confirmation handling, and deliberate fixture-only native deletion. The separate database/HTTP integration test installs actual YOURLS 1.10.6 into a disposable MariaDB instance and isolated site, loads Random ShortURLs, Allow Hyphens, Force Lowercase and ACh URL Guard, verifies monitoring/enforcement, authenticated HTTP API allow/deny and HTTP status, existing/new redirect targets, protected admin settings, and compares a full database snapshot before/after the read-only historical audit. It never fetches an external test URL or points at Production.
 
 The integration additionally proves repeated rejected checks are coalesced and other expensive requests are deferred across separate PHP processes with the **actual native YOURLS 15-second flood delay**; it verifies no YOURLS database mutations from this admission state.
 
@@ -123,7 +148,7 @@ This plugin **does not** normalize the path/keyword portion of lrl.li short URLs
 
 - HTTP status is not a definitive existence/quality or safety oracle. Authentication, geo-blocking, anti-bot challenges, rate limiting and transient failures can make good sites appear unavailable.
 - Google Web Risk and DNSBL have limited list coverage and may have false positives/negatives. They cannot guarantee that a link will never trigger Google Search Console or Cloudflare warnings. Reported abuse and malicious existing links still require operational review and service-provider reconsideration.
-- This v0.1.0 only offers manual, read-only scanning of previously created URLs. It does not deploy background jobs, create new tables, implement automated takedown, manage Search Console, or change Cloudflare settings.
+- The v0.2.0 candidate adds individually confirmed deletion and operator-approved filtered bulk deletion. A plugin-owned candidate table is created on the first bulk preview, and small resume/progress records are stored in YOURLS options. There is no autonomous background worker, cron, Search Console or Cloudflare integration.
 - Internationalized domain names should be supplied in standard ASCII/Punycode form. No extra composer dependencies or vendor packages are required.
 - CIDR safety checks use protocol/IANA special-purpose network assignments, independently of PHP's incomplete reserved-address flags; these safety boundaries may require maintenance when authoritative registries change.
 - HTTP redirect checking does not render JavaScript or execute a browser. JS-only redirects cannot be inferred reliably from an HTTP header.

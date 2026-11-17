@@ -208,6 +208,11 @@ $expect($pdo->query("SELECT url FROM yourls_url WHERE keyword='yourlsblog'")->fe
 $expect($pdo->query("SELECT COUNT(*) FROM yourls_url WHERE keyword LIKE 'deny-%'")->fetchColumn() == 0,
     'Denied keywords must not exist.');
 
+// These CLI acceptance calls deliberately simulate a logged-in administrator.
+// HTTP integration below separately tests anonymous real routes in both modes.
+yourls_set_user('integration');
+yourls_add_filter('shunt_is_valid_user', static fn() => true);
+
 ob_start();
 ach_url_guard_admin_page();
 $adminHtml = ob_get_clean();
@@ -254,6 +259,309 @@ $expect(($saved['blocked_url_terms'] ?? null) === ['casino'], 'Literal URL terms
 $expect(($saved['blocked_url_patterns'] ?? null) === ['~/(?:offer|sale)(?:/|$)~i'], 'PCRE patterns persist.');
 $expect(($saved['blocked_short_keywords'] ?? null) === ['reserved'], 'Custom reserved aliases persist.');
 $_POST = [];
+$_GET = [];
+$_SERVER['REQUEST_METHOD'] = 'GET';
+
+// Real YOURLS/MySQL historical review: read-only browsing followed by an
+// intentional deletion of only a disposable, test-owned link. The native
+// deletion/cache/hooks path runs inside the plugin's locked transaction.
+$historyDB = yourls_get_db('read-history_integration');
+$historyPolicy = \ACh\Yourls\UrlGuard\Policy::settings(
+    yourls_get_option('ach_url_guard_settings', [])
+);
+$baselineHistory = $pdo->query('SELECT keyword,url,title FROM yourls_url ORDER BY keyword')->fetchAll(PDO::FETCH_ASSOC);
+$historyPage = \ACh\Yourls\UrlGuard\HistoricalReview::page($historyDB, '', 25);
+$expect(count($historyPage['rows']) > 0, 'Historical browser must return real YOURLS URL rows.');
+ob_start();
+ach_url_guard_history_page();
+$historyHtml = ob_get_clean();
+$expect(str_contains($historyHtml, 'Historical Link Review'), 'Actual plugin review UI renders.');
+$expect(str_contains($historyHtml, 'Check HTTP'), 'Healthy records offer manual HTTP checks.');
+$expect(!str_contains($historyHtml, 'not-for-logs'), 'Historical UI never leaks private query tokens.');
+$expect($pdo->query('SELECT keyword,url,title FROM yourls_url ORDER BY keyword')->fetchAll(PDO::FETCH_ASSOC)
+    === $baselineHistory, 'Historical UI and page scanning cannot modify existing URLs.');
+
+$historyName = 'history-delete-fixture';
+$expect(yourls_insert_link_in_db('https://bad.example/private?token=DO_NOT_RENDER',
+    $historyName, 'History-only test record'), 'A flagged test-owned record must be inserted.');
+$marked = \ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName);
+$expect($marked !== null, 'Historical lookup retrieves the exact fixture row.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::inspect($marked, $historyPolicy)['reason']
+    === 'blocked_domain', 'Current local Guard policy flags fixture row.');
+$reviewProof = \ACh\Yourls\UrlGuard\HistoricalReview::proof($marked, $historyPolicy);
+$_SERVER['REQUEST_METHOD'] = 'POST';
+$_POST = [
+    'history_action' => 'review', 'history_keyword' => $historyName,
+    'nonce' => yourls_create_nonce('ach_url_guard_history_review'),
+];
+ob_start(); ach_url_guard_history_page(); $confirmationHTML = ob_get_clean();
+$expect(str_contains($confirmationHTML, 'Delete this short link permanently'),
+    'Real YOURLS nonce and admin review render a confirmation form.');
+$expect(!str_contains($confirmationHTML, 'DO_NOT_RENDER'),
+    'Review confirmation hides URL query tokens.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName) !== null,
+    'Review form must not delete a link.');
+
+$originalTitle = 'History-only test record';
+$updateHistory = $pdo->prepare('UPDATE yourls_url SET title = ? WHERE keyword = ?');
+$updateHistory->execute(['Changed after preview', $historyName]);
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::delete($historyDB, $historyName,
+    $reviewProof, 'blocked_domain', false, $historyPolicy) === 'stale',
+    'Native DB row edit invalidates the original approval.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName) !== null,
+    'Stale deletion cannot remove modified link.');
+$updateHistory->execute([$originalTitle, $historyName]);
+$marked = \ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName);
+$reviewProof = \ACh\Yourls\UrlGuard\HistoricalReview::proof($marked, $historyPolicy);
+
+// A concurrent admin policy save can outlive this PHP request's cached option.
+// Change only the disposable database's policy option and verify fresh SQL
+// inside the locked delete transaction rejects an obsolete approval.
+$policyUpdate = $pdo->prepare('UPDATE yourls_options SET option_value = ? WHERE option_name = ?');
+$modifiedPolicy = $saved;
+$modifiedPolicy['blocked_domains'] = [];
+$policyUpdate->execute([serialize($modifiedPolicy), 'ach_url_guard_settings']);
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::delete($historyDB, $historyName,
+    $reviewProof, 'blocked_domain', false, $historyPolicy) === 'stale',
+    'Concurrent stored policy change must cancel cached-policy deletion.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName) !== null,
+    'Link survives concurrent policy changes.');
+$policyUpdate->execute([serialize($saved), 'ach_url_guard_settings']);
+
+$cleanPolicy = $historyPolicy;
+$cleanPolicy['blocked_domains'] = [];
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::delete($historyDB, $historyName,
+    \ACh\Yourls\UrlGuard\HistoricalReview::proof($marked, $cleanPolicy),
+    'blocked_domain', false, $cleanPolicy) === 'no_longer_flagged',
+    'Policy no longer flagging link prevents deletion.');
+
+$_POST = [
+    'history_action' => 'delete', 'history_keyword' => $historyName,
+    'history_proof' => $reviewProof, 'history_reason' => 'blocked_domain',
+    'history_scope' => 'local', 'history_confirm' => '1',
+    'nonce' => yourls_create_nonce('ach_url_guard_history_delete'),
+];
+ob_start(); ach_url_guard_history_page(); $deletedHTML = ob_get_clean();
+$expect(str_contains($deletedHTML, 'Reviewed short link was deleted'),
+    'Explicit YOURLS admin confirmation deletes only tested fixture.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName) === null,
+    'Native deletion removed the test-owned row.');
+$expect(yourls_get_keyword_infos($historyName, false) === false,
+    'Native YOURLS keyword lookup observes deleted record.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::delete($historyDB, $historyName,
+    $reviewProof, 'blocked_domain', false, $historyPolicy) === 'stale',
+    'A repeated delete cannot alter any other row.');
+$expect($pdo->query("SELECT url FROM yourls_url WHERE keyword='yourlsblog'")->fetchColumn()
+    === $knownBefore, 'Pre-existing YOURLS redirect stays intact after reviewed deletion.');
+$_POST = [];
+$_GET = [];
+$_SERVER['REQUEST_METHOD'] = 'GET';
+
+// Bulk review on real MySQL/InnoDB: create the indexed candidate table, scan
+// across a disposable job, delete only fixture-owned matches, and preserve
+// healthy, stale, or subsequently created records.
+$bulkDB = yourls_get_db('read-bulk_integration');
+$bulkAllowed = yourls_insert_link_in_db('https://example.com/safe-page',
+    'bulk-safe-fixture', 'Keep this link');
+$bulkMarked1 = yourls_insert_link_in_db('https://bad.example/unwanted',
+    'bulk-flagged-a', 'Flagged fixture A');
+$bulkMarked2 = yourls_insert_link_in_db('https://bad.example/unwanted2',
+    'bulk-flagged-b', 'Flagged fixture B');
+$expect($bulkAllowed && $bulkMarked1 && $bulkMarked2, 'Bulk fixture inserts succeed.');
+$bulkJob = \ACh\Yourls\UrlGuard\BulkHistory::create($bulkDB, 'integration', 'page',
+    \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason' => 'blocked_domain']),
+    ['bulk-safe-fixture','bulk-flagged-a','bulk-flagged-b']);
+$bulkJob = \ACh\Yourls\UrlGuard\BulkHistory::scanStep($bulkDB, $bulkJob['id'], 'integration');
+$expect($bulkJob['phase'] === 'ready' && $bulkJob['matched'] === 2,
+    'Native MariaDB dry-run flags exactly two fixture URLs.');
+$expect((string) $pdo->query("SELECT url FROM yourls_url WHERE keyword='bulk-safe-fixture'")->fetchColumn()
+    === 'https://example.com/safe-page', 'Dry-run does not touch URLs.');
+$bulkJob = \ACh\Yourls\UrlGuard\BulkHistory::startDeletion($bulkDB, $bulkJob['id'],
+    'integration', 'DELETE 2', true);
+$bulkJob = \ACh\Yourls\UrlGuard\BulkHistory::deleteStep($bulkDB, $bulkJob['id'], 'integration');
+$expect($bulkJob['phase'] === 'done' && $bulkJob['deleted'] === 2 && $bulkJob['skipped'] === 0,
+    'Exact two flagged fixture URLs deleted using native YOURLS function.');
+$expect($pdo->query("SELECT COUNT(*) FROM yourls_url WHERE keyword LIKE 'bulk-%'")->fetchColumn() == 1,
+    'Healthy fixture remains and only approved candidates deleted.');
+$expect($pdo->query("SELECT url FROM yourls_url WHERE keyword='yourlsblog'")->fetchColumn()
+    === $knownBefore, 'Bulk deletion did not damage unrelated historical links.');
+\ACh\Yourls\UrlGuard\BulkHistory::clear($bulkDB, $bulkJob['id'], 'integration');
+
+// Real MariaDB/InnoDB B1: a redirect can increment click count *after*
+// a network probe starts but before deleteStep takes the URL row lock.
+// The proof deliberately omits clicks, so the locked metadata check must
+// independently skip this now-active zero-click candidate.
+foreach (['bulk-net-active','bulk-net-stable','bulk-net-already-clicked'] as $key) {
+    $expect(yourls_insert_link_in_db('https://example.com/' . $key, $key, 'Network bulk fixture'),
+        'Can insert disposable network bulk link ' . $key);
+}
+$pdo->prepare('UPDATE yourls_url SET clicks = 1 WHERE keyword = ?')
+    ->execute(['bulk-net-already-clicked']);
+$networkClickJob = \ACh\Yourls\UrlGuard\BulkHistory::create($bulkDB, 'integration', 'page',
+    \ACh\Yourls\UrlGuard\BulkHistory::filter([
+        'reason'=>'http_not_found', 'clicks'=>'zero', 'host'=>'example.com',
+        'prefix'=>'bulk-net-', 'before'=>'2099-12-31',
+    ]),
+    ['bulk-net-active','bulk-net-stable','bulk-net-already-clicked']);
+$networkCalls = [];
+$networkProbe = static function (string $url, array $cfg) use ($pdo, $bulkDB, &$networkCalls, $expect): array {
+    $expect(!$bulkDB->inTransaction(), 'HTTP probe must run outside MariaDB transaction and row locks.');
+    $key = basename((string) parse_url($url, PHP_URL_PATH));
+    $networkCalls[$key] = ($networkCalls[$key] ?? 0) + 1;
+    if ($key === 'bulk-net-active' && $networkCalls[$key] === 2) {
+        // Simulate another request recording a click while the HTTP check
+        // is in progress, before the deletion request acquires a row lock.
+        $pdo->prepare('UPDATE yourls_url SET clicks=clicks+1 WHERE keyword=?')
+            ->execute(['bulk-net-active']);
+    }
+    return ['status'=>'deny','reason'=>'http_not_found'];
+};
+$steps = 0;
+while ($networkClickJob['phase'] === 'scan') {
+    $networkClickJob = \ACh\Yourls\UrlGuard\BulkHistory::scanStep($bulkDB,
+        $networkClickJob['id'], 'integration', $networkProbe);
+    $expect(++$steps < 10, 'Bounded network scan must complete.');
+}
+$expect($networkClickJob['matched'] === 2, 'Zero-click dry-run includes two definite HTTP candidates.');
+$networkClickJob = \ACh\Yourls\UrlGuard\BulkHistory::startDeletion($bulkDB,
+    $networkClickJob['id'], 'integration', 'DELETE 2', true);
+$steps = 0;
+while ($networkClickJob['phase'] === 'delete') {
+    $networkClickJob = \ACh\Yourls\UrlGuard\BulkHistory::deleteStep($bulkDB,
+        $networkClickJob['id'], 'integration', $networkProbe);
+    $expect(++$steps < 10, 'Bounded network deletion must complete.');
+}
+$expect($networkClickJob['phase'] === 'done' && $networkClickJob['processed'] === 2
+    && $networkClickJob['deleted'] === 1 && $networkClickJob['skipped'] === 1,
+    'Locked MariaDB metadata check skips newly-clicked HTTP 404 and deletes stable zero-click link.');
+$expect($networkCalls['bulk-net-active'] === 2 && $networkCalls['bulk-net-stable'] === 2,
+    'Each previewed candidate has a separate pre-lock network recheck.');
+$expect((int)$pdo->query("SELECT clicks FROM yourls_url WHERE keyword='bulk-net-active'")->fetchColumn() === 1
+    && \ACh\Yourls\UrlGuard\HistoricalReview::find($bulkDB, 'bulk-net-stable') === null
+    && \ACh\Yourls\UrlGuard\HistoricalReview::find($bulkDB, 'bulk-net-already-clicked') !== null,
+    'Real database preserves newly clicked and already clicked links; stable candidate removed.');
+$expect(\ACh\Yourls\UrlGuard\BulkHistory::deleteStep($bulkDB,
+    $networkClickJob['id'], 'integration')['deleted'] === 1,
+    'Repeated completed MariaDB network deletion is inert.');
+$candidateStatuses = $bulkDB->fetchAll(
+    'SELECT keyword,result FROM yourls_ach_guard_candidates WHERE job_id = :id ORDER BY keyword',
+    ['id' => $networkClickJob['id']]
+);
+$expect($candidateStatuses === [
+    ['keyword'=>'bulk-net-active','result'=>'skipped'],
+    ['keyword'=>'bulk-net-stable','result'=>'deleted'],
+], 'Real MariaDB snapshot stores exact skipped/deleted reason outcomes.');
+\ACh\Yourls\UrlGuard\BulkHistory::clear($bulkDB, $networkClickJob['id'], 'integration');
+
+// B2: first-party admin must require explicit consent for every advertised
+// network-derived reason (not just HTTP 404/410).
+foreach (\ACh\Yourls\UrlGuard\BulkHistory::networkReasons() as $reason) {
+    $_SERVER['REQUEST_METHOD'] = 'POST';
+    $_POST = [
+        'bulk_action'=>'create','bulk_nonce'=>yourls_create_nonce('ach_url_guard_bulk'),
+        'bulk_mode'=>'page','bulk_filter'=>['reason'=>$reason],
+        'bulk_keywords'=>['bulk-net-active'],
+    ];
+    [$refusedJob,$refusal] = ach_url_guard_bulk_request($bulkDB);
+    $expect($refusedJob === null && str_contains($refusal, 'Confirm HTTP/DNS network scanning'),
+        'Missing explicit network consent refuses admin job for '.$reason);
+}
+$_SERVER['REQUEST_METHOD'] = 'GET';
+$_POST = [];
+
+// Exercise actual DNS/redirect transport policies through injectable resolver
+// and requester, never a live external provider or unsafe outbound HTTP request.
+$unsafeDnsRequests = 0;
+$privateDnsProbe = new \ACh\Yourls\UrlGuard\HttpProbe(
+    static fn(string $host): array => ['8.8.8.8','127.0.0.1'],
+    static function () use (&$unsafeDnsRequests): array {
+        $unsafeDnsRequests++;
+        return ['http_code'=>200];
+    }
+);
+$badRedirectRequests = 0;
+$badRedirectProbe = new \ACh\Yourls\UrlGuard\HttpProbe(
+    static fn(string $host): array => ['8.8.8.8'],
+    static function () use (&$badRedirectRequests): array {
+        $badRedirectRequests++;
+        return ['http_code'=>302,'location'=>"/bad\nlocation"];
+    }
+);
+foreach ([
+    'private_dns_address'=>['bulk-dns-fixture','https://example.com/dns-fixture',$privateDnsProbe],
+    'invalid_redirect'=>['bulk-redirect-fixture','https://example.com/redirect-fixture',$badRedirectProbe],
+] as $reason=>[$keyword,$url,$httpProbe]) {
+    $expect(\ACh\Yourls\UrlGuard\BulkHistory::networkMode(
+        \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason'=>$reason])),
+        'Network scan explicitly enabled for advertised '.$reason);
+    $expect(yourls_insert_link_in_db($url,$keyword,'Network reason fixture'),
+        'Insert disposable network-reason URL '.$reason);
+    $_SERVER['REQUEST_METHOD'] = 'POST';
+    $_POST = [
+        'bulk_action'=>'create','bulk_nonce'=>yourls_create_nonce('ach_url_guard_bulk'),
+        'bulk_mode'=>'page','bulk_filter'=>['reason'=>$reason],
+        'bulk_keywords'=>[$keyword], 'bulk_http_ack'=>'1',
+    ];
+    [$createdJob,$creationError] = ach_url_guard_bulk_request($bulkDB);
+    $expect($createdJob !== null && $creationError === '',
+        'Confirmed admin opt-in starts network reason job '.$reason);
+    $_SERVER['REQUEST_METHOD'] = 'GET';
+    $_POST = [];
+    $callback = static fn(string $target, array $cfg): array => $httpProbe->check($target,$cfg);
+    $createdJob = \ACh\Yourls\UrlGuard\BulkHistory::scanStep($bulkDB,
+        $createdJob['id'], 'integration', $callback);
+    $expect($createdJob['phase']==='ready' && $createdJob['matched']===1,
+        'Native MariaDB scan materializes network-only reason '.$reason);
+    $createdJob = \ACh\Yourls\UrlGuard\BulkHistory::startDeletion($bulkDB,
+        $createdJob['id'], 'integration', 'DELETE 1', true);
+    $createdJob = \ACh\Yourls\UrlGuard\BulkHistory::deleteStep($bulkDB,
+        $createdJob['id'], 'integration', $callback);
+    $expect($createdJob['phase']==='done' && $createdJob['deleted']===1
+        && \ACh\Yourls\UrlGuard\HistoricalReview::find($bulkDB,$keyword)===null,
+        'Native MariaDB deletion revalidates network reason '.$reason);
+    \ACh\Yourls\UrlGuard\BulkHistory::clear($bulkDB, $createdJob['id'], 'integration');
+}
+$expect($unsafeDnsRequests === 0,
+    'Private DNS addresses never trigger HTTP transport (real HttpProbe injected resolver).');
+$expect($badRedirectRequests === 2,
+    'Invalid redirects only fetch the original safe host, once during preview and recheck.');
+$_POST = [];
+$_SERVER['REQUEST_METHOD'] = 'GET';
+
+// Network-only historical deletion with deterministic injection and no
+// external traffic. Includes healthy, ambiguous, and confirmed missing URLs.
+$networkCases = [
+    ['net-missing-404', 'https://example.com/missing-404', 'deny', 'http_not_found'],
+    ['net-missing-410', 'https://example.com/missing-410', 'deny', 'http_not_found'],
+    ['net-healthy', 'https://example.com/healthy', 'allow', 'checks_passed'],
+    ['net-timeout', 'https://example.com/timeout', 'unknown', 'connection_error'],
+    ['net-unavailable', 'https://example.com/403', 'unknown', 'http_inconclusive'],
+];
+$fakeProbe = static function (string $url): array {
+    if (str_contains($url, 'missing-404') || str_contains($url, 'missing-410')) {
+        return ['status' => 'deny', 'reason' => 'http_not_found'];
+    }
+    if (str_contains($url, 'timeout')) return ['status' => 'unknown', 'reason' => 'connection_error'];
+    if (str_contains($url, '/403')) return ['status' => 'unknown', 'reason' => 'http_inconclusive'];
+    return ['status' => 'allow', 'reason' => 'checks_passed'];
+};
+foreach ($networkCases as [$key,$url,$status,$reason]) {
+    $expect(yourls_insert_link_in_db($url,$key,'Network fixture'), 'Fixture inserted: '.$key);
+    $row = \ACh\Yourls\UrlGuard\HistoricalReview::find($bulkDB,$key);
+    $result = \ACh\Yourls\UrlGuard\HistoricalReview::inspect($row, $historyPolicy, true, $fakeProbe);
+    $expect($result['status'] === $status && $result['reason'] === $reason,
+        'Controlled network verdict matches '.$key);
+    $proof = \ACh\Yourls\UrlGuard\HistoricalReview::proof($row,$historyPolicy);
+    $attempt = \ACh\Yourls\UrlGuard\HistoricalReview::delete($bulkDB,$key,$proof,
+        $reason,true,$historyPolicy,$fakeProbe);
+    $expect($attempt === ($status === 'deny' ? 'deleted' : 'no_longer_flagged'),
+        'Destructive network gate preserves all non-definite links '.$key);
+    $remaining = \ACh\Yourls\UrlGuard\HistoricalReview::find($bulkDB,$key);
+    $expect(($remaining===null) === ($status==='deny'), 'Network delete row state '.$key);
+}
+
+$_POST = [];
+$_GET = [];
 $_SERVER['REQUEST_METHOD'] = 'GET';
 
 echo 'PASS real DB integration: active plugins, monitor, enforce, API, admin callback, old links, data privacy.' . "\n";
