@@ -81,9 +81,18 @@ final class BulkHistory
         return compact('reason', 'clicks', 'host', 'prefix', 'before');
     }
 
+    /**
+     * Network-derived reasons need explicit operator consent and a bounded
+     * probe. Every advertised definite reason is either local or covered here.
+     */
+    public static function networkReasons(): array
+    {
+        return ['http_not_found', 'private_dns_address', 'invalid_redirect'];
+    }
+
     public static function networkMode(array $filter): bool
     {
-        return $filter['reason'] === 'http_not_found';
+        return in_array($filter['reason'], self::networkReasons(), true);
     }
 
     private static function policyHash(array $settings): string
@@ -218,19 +227,30 @@ final class BulkHistory
             array_slice($raw, 0, $size)), $more];
     }
 
+    /**
+     * Cheap, mutable selection criteria. Must be rechecked on the locked
+     * URL row even after a slow HTTP/DNS probe, because click counts can
+     * change without invalidating the URL identity HMAC.
+     */
+    public static function matchesMetadata(array $row, array $filter): bool
+    {
+        if ($filter['clicks'] === 'zero' && (int) $row['clicks'] !== 0) return false;
+        if ($filter['clicks'] === 'positive' && (int) $row['clicks'] === 0) return false;
+        if ($filter['before'] !== '' && substr((string) $row['timestamp'], 0, 10) > $filter['before']) {
+            return false;
+        }
+        if ($filter['prefix'] !== '' && !str_starts_with((string) $row['keyword'], $filter['prefix'])) {
+            return false;
+        }
+        if ($filter['host'] !== '' && strtolower(HistoricalReview::hostLabel((string) $row['url']))
+            !== $filter['host']) return false;
+        return true;
+    }
+
     /** Select only definite violations of the *current* policy and filters. */
     public static function matches(array $row, array $settings, array $filter, ?callable $probe = null): ?array
     {
-        if ($filter['clicks'] === 'zero' && (int) $row['clicks'] !== 0) return null;
-        if ($filter['clicks'] === 'positive' && (int) $row['clicks'] === 0) return null;
-        if ($filter['before'] !== '' && substr((string) $row['timestamp'], 0, 10) > $filter['before']) {
-            return null;
-        }
-        if ($filter['prefix'] !== '' && !str_starts_with((string) $row['keyword'], $filter['prefix'])) {
-            return null;
-        }
-        if ($filter['host'] !== '' && strtolower(HistoricalReview::hostLabel((string) $row['url']))
-            !== $filter['host']) return null;
+        if (!self::matchesMetadata($row, $filter)) return null;
         $network = self::networkMode($filter);
         $decision = HistoricalReview::inspect($row, $settings, $network, $probe);
         if (($decision['status'] ?? '') !== 'deny') return null;
@@ -401,6 +421,12 @@ final class BulkHistory
                     && hash_equals((string) $candidate['row_proof'], $check['proof'])
                     && hash_equals((string) $candidate['row_proof'],
                         HistoricalReview::proof($latest, $current));
+                // Re-evaluate *all* mutable metadata under the row lock in
+                // both network and local modes. Never do network I/O while
+                // a database row or job lock is held.
+                if ($approved) {
+                    $approved = self::matchesMetadata($latest, $job['filter']);
+                }
                 if ($approved && !self::networkMode($job['filter'])) {
                     $final = self::matches($latest, $current, $job['filter']);
                     $approved = $final !== null && $final['reason'] === $reason;

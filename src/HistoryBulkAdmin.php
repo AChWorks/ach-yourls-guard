@@ -24,11 +24,13 @@ function ach_url_guard_bulk_request($db): array
                 if (!is_array($selected)) throw new InvalidArgumentException('Invalid page selection');
                 $filters = $_POST['bulk_filter'] ?? [];
                 if (!is_array($filters)) throw new InvalidArgumentException('Invalid filters');
-                if (($filters['reason'] ?? '') === 'http_not_found' && !isset($_POST['bulk_http_ack'])) {
-                    throw new InvalidArgumentException('Confirm HTTP network scanning before starting');
+                $filter = BulkHistory::filter($filters);
+                if (BulkHistory::networkMode($filter)
+                    && ach_url_guard_bulk_post('bulk_http_ack') !== '1') {
+                    throw new InvalidArgumentException('Confirm HTTP/DNS network scanning before starting');
                 }
                 $job = BulkHistory::create($db, $owner, ach_url_guard_bulk_post('bulk_mode'),
-                    $filters, $selected);
+                    $filter, $selected);
             } else {
                 $id = ach_url_guard_bulk_post('bulk_job');
                 if ($action === 'step') {
@@ -103,7 +105,7 @@ function ach_url_guard_bulk_job(array $job): void
         echo ach_url_guard_history_hidden('bulk_job', $id);
         echo ach_url_guard_history_hidden('bulk_nonce', yourls_create_nonce('ach_url_guard_bulk'));
         echo '<button type="submit" class="button primary">' . $label . '</button></form>';
-        ach_url_guard_bulk_action_form('cancel', $id, 'Stop and keep progress');
+        ach_url_guard_bulk_action_form('cancel', $id, 'Cancel job permanently (completed deletions remain)');
         echo '<button type="button" id="ach-bulk-pause-browser" class="button">Pause automatic continuation</button>';
         echo '<script>(function(){var form=document.getElementById("ach-bulk-step");'
             . 'var pause=document.getElementById("ach-bulk-pause-browser");'
@@ -196,7 +198,8 @@ function ach_url_guard_bulk_filter_form(): void
         . '<label>Keyword prefix: <input type="text" name="bulk_filter[prefix]" /></label> '
         . '<label>Created on or before: <input type="date" name="bulk_filter[before]" /></label></p>';
     echo '<p><label><input type="checkbox" name="bulk_http_ack" value="1" /> '
-        . 'I approve outbound HTTP checks if selecting HTTP 404/410.'
+        . 'I approve outbound HTTP/DNS checks when selecting HTTP 404/410,'
+        . ' Private DNS address, or Invalid redirect.'
         . ' This runs one checked link per request and can be costly/slow for large sets.'
         . ' DNSBL/Google Web Risk are never used.</label></p>';
     echo '<p><button type="submit" class="button primary">Preview selected/filter-matching links (no deletion)</button></p>';

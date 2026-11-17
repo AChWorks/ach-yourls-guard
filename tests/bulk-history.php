@@ -193,4 +193,142 @@ assertBulk($job['phase']==='done' && $job['deleted']===1,'network-backed bulk de
 assertBulk(count($db->fetchAll('SELECT keyword FROM yourls_url WHERE keyword=:key',['key'=>'nettimeout']))===1,
     'uncertain timeout never mass-deleted');
 BulkHistory::clear($db,$job['id'],'fixture-admin');
+
+// B1: a live redirect increments clicks while the network check is in progress.
+// The operator selected zero-click links and confirmed two candidates.
+foreach (['click-active', 'click-stable', 'click-nonzero'] as $key) {
+    $db->fetchAffected('INSERT INTO yourls_url(keyword,url,title,timestamp,clicks)'
+        . ' VALUES (:key,:url,:title,:time,:clicks)', [
+        'key' => $key, 'url' => 'https://example.com/' . $key,
+        'title' => 'click fixture', 'time' => '2026-11-12 10:00:00',
+        'clicks' => $key === 'click-nonzero' ? 1 : 0,
+    ]);
+}
+$clickFilter = BulkHistory::filter([
+    'reason' => 'http_not_found', 'clicks' => 'zero', 'host' => 'example.com',
+    'prefix' => 'click-', 'before' => '2026-11-13',
+]);
+$clickJob = BulkHistory::create($db, 'fixture-admin', 'page', $clickFilter,
+    ['click-active', 'click-stable', 'click-nonzero']);
+$meta = [
+    'keyword'=>'click-active', 'url'=>'https://example.com/click-active',
+    'timestamp'=>'2026-11-12 10:00:00', 'clicks'=>0,
+];
+assertBulk(BulkHistory::matchesMetadata($meta, $clickFilter),
+    'matching click/date/prefix/host metadata accepted');
+foreach ([
+    'clicks'=>['clicks'=>1],
+    'date'=>['timestamp'=>'2026-11-14 00:00:00'],
+    'prefix'=>['keyword'=>'wrong-prefix'],
+    'host'=>['url'=>'https://different.example/click-active'],
+] as $field=>$change) {
+    assertBulk(!BulkHistory::matchesMetadata(array_replace($meta,$change),$clickFilter),
+        'locked metadata filter rejects changed ' . $field);
+}
+
+$probeCalls = [];
+$clickProbe = static function (string $url, array $cfg) use ($db, &$probeCalls): array {
+    assertBulk(!$db->inTransaction(), 'network callbacks must run outside transaction/row locks');
+    $key = basename(parse_url($url, PHP_URL_PATH));
+    $probeCalls[$key] = ($probeCalls[$key] ?? 0) + 1;
+    if ($key === 'click-active' && $probeCalls[$key] === 2) {
+        $db->fetchAffected('UPDATE yourls_url SET clicks=1 WHERE keyword=:keyword',
+            ['keyword' => 'click-active']);
+    }
+    return ['status' => 'deny', 'reason' => 'http_not_found'];
+};
+while ($clickJob['phase'] === 'scan') {
+    $clickJob = BulkHistory::scanStep($db, $clickJob['id'], 'fixture-admin', $clickProbe);
+}
+assertBulk($clickJob['matched'] === 2, 'zero-click filter excludes already-clicked link from dry-run');
+$clickJob = BulkHistory::startDeletion($db, $clickJob['id'], 'fixture-admin', 'DELETE 2', true);
+while ($clickJob['phase'] === 'delete') {
+    $clickJob = BulkHistory::deleteStep($db, $clickJob['id'], 'fixture-admin', $clickProbe);
+}
+assertBulk($clickJob['deleted'] === 1 && $clickJob['skipped'] === 1 && $clickJob['processed'] === 2,
+    'network row that became clicked during probe is skipped with accurate counters');
+assertBulk($probeCalls['click-active'] === 2 && $probeCalls['click-stable'] === 2,
+    'both candidates get exactly one preflight and one deletion recheck');
+assertBulk(HistoricalReview::find($db, 'click-active') !== null
+    && HistoricalReview::find($db, 'click-stable') === null
+    && HistoricalReview::find($db, 'click-nonzero') !== null,
+    'newly active and originally active links survive but approved stable zero-click is deleted');
+assertBulk(BulkHistory::deleteStep($db, $clickJob['id'], 'fixture-admin')['deleted'] === 1,
+    'completed network deletion does not repeat');
+BulkHistory::clear($db, $clickJob['id'], 'fixture-admin');
+
+// B2: all advertised network-only reasons must actually trigger the probe.
+// Use HttpProbe's real DNS/redirect logic with controlled local resolvers and
+// requesters: no real outbound traffic, no unsafe-address HTTP requests.
+assertBulk(BulkHistory::networkReasons()
+    === ['http_not_found', 'private_dns_address', 'invalid_redirect'],
+    'network-derived filter reasons are explicitly defined');
+$reqCount = 0;
+$privateProbe = new \ACh\Yourls\UrlGuard\HttpProbe(
+    static fn(string $host): array => ['8.8.8.8', '127.0.0.1'],
+    static function () use (&$reqCount): array {
+        $reqCount++;
+        return ['http_code' => 200];
+    }
+);
+$privateDecision = $privateProbe->check('https://example.com/dns-target',
+    \ACh\Yourls\UrlGuard\Policy::settings($settings));
+assertBulk($privateDecision['status'] === 'deny'
+    && $privateDecision['reason'] === 'private_dns_address' && $reqCount === 0,
+    'private DNS blocked without any outbound HTTP request');
+$redirectRequests = [];
+$redirectProbe = new \ACh\Yourls\UrlGuard\HttpProbe(
+    static fn(string $host): array => ['8.8.8.8'],
+    static function (string $url, array $ips, string $method, array $cfg)
+        use (&$redirectRequests): array {
+        $redirectRequests[] = [$url, $method];
+        return ['http_code' => 302, 'location' => "/bad\nlocation"];
+    }
+);
+$redirectDecision = $redirectProbe->check('https://example.com/redirect-target',
+    \ACh\Yourls\UrlGuard\Policy::settings($settings));
+assertBulk($redirectDecision['status'] === 'deny'
+    && $redirectDecision['reason'] === 'invalid_redirect'
+    && count($redirectRequests) === 1 && $redirectRequests[0][1] === 'GET',
+    'invalid redirect rejected after one safe GET, without following bad target');
+foreach ([
+    'private_dns_address' => ['net-dns', 'https://example.com/dns-target', $privateProbe],
+    'invalid_redirect' => ['net-redirect', 'https://example.com/redirect-target', $redirectProbe],
+] as $reason => [$keyword, $url, $realProbe]) {
+    assertBulk(BulkHistory::networkMode(BulkHistory::filter(['reason' => $reason])),
+        'network mode enabled for ' . $reason);
+    $db->fetchAffected('INSERT INTO yourls_url(keyword,url,title,timestamp,clicks)'
+        . ' VALUES (:key,:url,:title,:time,0)', [
+        'key' => $keyword, 'url' => $url, 'title' => 'network reason fixture',
+        'time' => '2026-11-12 10:00:00',
+    ]);
+    $callback = static fn(string $candidate, array $cfg): array => $realProbe->check($candidate, $cfg);
+    $job = BulkHistory::create($db, 'fixture-admin', 'page',
+        BulkHistory::filter(['reason' => $reason]), [$keyword]);
+    $job = BulkHistory::scanStep($db, $job['id'], 'fixture-admin', $callback);
+    assertBulk($job['phase'] === 'ready' && $job['matched'] === 1,
+        'advertised reason ' . $reason . ' identifies matching candidate');
+    $job = BulkHistory::startDeletion($db, $job['id'], 'fixture-admin', 'DELETE 1', true);
+    $job = BulkHistory::deleteStep($db, $job['id'], 'fixture-admin', $callback);
+    assertBulk($job['phase'] === 'done' && $job['deleted'] === 1
+        && HistoricalReview::find($db, $keyword) === null,
+        'definite ' . $reason . ' candidate reverified and deleted in disposable fixture');
+    BulkHistory::clear($db, $job['id'], 'fixture-admin');
+}
+$unknownProbe = static fn(string $url, array $cfg): array =>
+    ['status' => 'unknown', 'reason' => 'dns_unresolved'];
+$db->fetchAffected('INSERT INTO yourls_url(keyword,url,title,timestamp,clicks)'
+    . ' VALUES (:key,:url,:title,:time,0)', [
+    'key' => 'net-unknown-dns', 'url' => 'https://example.com/unresolved',
+    'title' => 'inconclusive', 'time' => '2026-11-12 10:00:00',
+]);
+$job = BulkHistory::create($db, 'fixture-admin', 'page',
+    BulkHistory::filter(['reason' => 'private_dns_address']), ['net-unknown-dns']);
+$job = BulkHistory::scanStep($db, $job['id'], 'fixture-admin', $unknownProbe);
+assertBulk($job['phase'] === 'ready' && $job['matched'] === 0
+    && HistoricalReview::find($db, 'net-unknown-dns') !== null,
+    'unknown DNS outcome never enters destructive candidate snapshot');
+BulkHistory::cancel($db, $job['id'], 'fixture-admin');
+BulkHistory::clear($db, $job['id'], 'fixture-admin');
+
 echo 'PASS '.$checks.' bulk selection/filter/snapshot/chunk/cancel/network-state assertions in disposable SQLite'.PHP_EOL;

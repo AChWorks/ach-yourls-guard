@@ -59,9 +59,12 @@ redirects and customer data.
   and CSRF authorization before native YOURLS deletion. Skip changed, healthy
   or unknown candidates and never substitute later links for snapshotted
   candidates. Historical/generated alias length alone is not a delete reason.
-  Optional HTTP 404/410 bulk scanning must be explicitly opted into, bounded
-  to one check per request and rechecked before deletion. No DNSBL/Google
-  scans merely by opening the admin page.
+  Network-derived HTTP 404/410, private DNS and invalid-redirect bulk filters
+  must be explicitly opted into. Bound verification to one target per request,
+  repeat the network check before deletion, and recheck click count (plus date,
+  keyword prefix and host) on the locked URL row in both local/network modes
+  without performing HTTP under a row lock. No DNSBL/Google scans merely by
+  opening the admin page.
 - No unattended auto-delete, scheduled worker/cron, redirect-time block or
   unrelated site mutation. Permanent deletion requires an authenticated admin
   and specific approval. One plugin-owned candidate table is created on first

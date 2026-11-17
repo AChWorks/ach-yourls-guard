@@ -186,6 +186,27 @@ check(!str_contains($html, 'NEVER_SHOW') && !str_contains($html, 'DO_NOT_EXPOSE'
 check(!str_contains($html, 'api_key='), 'full URL query not rendered');
 check($db->rows === $original && $db->deletes === 0, 'opening/previewing admin never deletes');
 
+// B2: every advertised network-derived filter requires explicit consent,
+ // even for manual current-page selections; no URL rows change.
+foreach (\ACh\Yourls\UrlGuard\BulkHistory::networkReasons() as $networkReason) {
+    $_SERVER['REQUEST_METHOD'] = 'POST';
+    $_POST = [
+        'bulk_action' => 'create', 'bulk_nonce' => yourls_create_nonce('ach_url_guard_bulk'),
+        'bulk_mode' => 'page', 'bulk_keywords' => ['bad'],
+        'bulk_filter' => ['reason' => $networkReason],
+    ];
+    [$unconfirmedJob, $consentError] = ach_url_guard_bulk_request($db);
+    check($unconfirmedJob === null && str_contains($consentError, 'Confirm HTTP/DNS network scanning'),
+        'network reason ' . $networkReason . ' requires consent before any candidate scan');
+    check($db->deletes === 0, 'missing network consent causes no deletion');
+    $_POST['bulk_http_ack'] = '0';
+    [$invalidAckJob, $invalidAckError] = ach_url_guard_bulk_request($db);
+    check($invalidAckJob === null && str_contains($invalidAckError, 'Confirm HTTP/DNS'),
+        'network consent requires explicit checked value for ' . $networkReason);
+}
+$_SERVER['REQUEST_METHOD'] = 'GET';
+$_POST = [];
+
 // Prove an unconfirmed or stale confirmation is inert.
 $bad = $db->rows['bad'];
 $proof = HistoricalReview::proof($bad, $settings);

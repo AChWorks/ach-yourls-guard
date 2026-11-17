@@ -387,6 +387,147 @@ $expect($pdo->query("SELECT url FROM yourls_url WHERE keyword='yourlsblog'")->fe
     === $knownBefore, 'Bulk deletion did not damage unrelated historical links.');
 \ACh\Yourls\UrlGuard\BulkHistory::clear($bulkDB, $bulkJob['id'], 'integration');
 
+// Real MariaDB/InnoDB B1: a redirect can increment click count *after*
+// a network probe starts but before deleteStep takes the URL row lock.
+// The proof deliberately omits clicks, so the locked metadata check must
+// independently skip this now-active zero-click candidate.
+foreach (['bulk-net-active','bulk-net-stable','bulk-net-already-clicked'] as $key) {
+    $expect(yourls_insert_link_in_db('https://example.com/' . $key, $key, 'Network bulk fixture'),
+        'Can insert disposable network bulk link ' . $key);
+}
+$pdo->prepare('UPDATE yourls_url SET clicks = 1 WHERE keyword = ?')
+    ->execute(['bulk-net-already-clicked']);
+$networkClickJob = \ACh\Yourls\UrlGuard\BulkHistory::create($bulkDB, 'integration', 'page',
+    \ACh\Yourls\UrlGuard\BulkHistory::filter([
+        'reason'=>'http_not_found', 'clicks'=>'zero', 'host'=>'example.com',
+        'prefix'=>'bulk-net-', 'before'=>'2099-12-31',
+    ]),
+    ['bulk-net-active','bulk-net-stable','bulk-net-already-clicked']);
+$networkCalls = [];
+$networkProbe = static function (string $url, array $cfg) use ($pdo, $bulkDB, &$networkCalls, $expect): array {
+    $expect(!$bulkDB->inTransaction(), 'HTTP probe must run outside MariaDB transaction and row locks.');
+    $key = basename((string) parse_url($url, PHP_URL_PATH));
+    $networkCalls[$key] = ($networkCalls[$key] ?? 0) + 1;
+    if ($key === 'bulk-net-active' && $networkCalls[$key] === 2) {
+        // Simulate another request recording a click while the HTTP check
+        // is in progress, before the deletion request acquires a row lock.
+        $pdo->prepare('UPDATE yourls_url SET clicks=clicks+1 WHERE keyword=?')
+            ->execute(['bulk-net-active']);
+    }
+    return ['status'=>'deny','reason'=>'http_not_found'];
+};
+$steps = 0;
+while ($networkClickJob['phase'] === 'scan') {
+    $networkClickJob = \ACh\Yourls\UrlGuard\BulkHistory::scanStep($bulkDB,
+        $networkClickJob['id'], 'integration', $networkProbe);
+    $expect(++$steps < 10, 'Bounded network scan must complete.');
+}
+$expect($networkClickJob['matched'] === 2, 'Zero-click dry-run includes two definite HTTP candidates.');
+$networkClickJob = \ACh\Yourls\UrlGuard\BulkHistory::startDeletion($bulkDB,
+    $networkClickJob['id'], 'integration', 'DELETE 2', true);
+$steps = 0;
+while ($networkClickJob['phase'] === 'delete') {
+    $networkClickJob = \ACh\Yourls\UrlGuard\BulkHistory::deleteStep($bulkDB,
+        $networkClickJob['id'], 'integration', $networkProbe);
+    $expect(++$steps < 10, 'Bounded network deletion must complete.');
+}
+$expect($networkClickJob['phase'] === 'done' && $networkClickJob['processed'] === 2
+    && $networkClickJob['deleted'] === 1 && $networkClickJob['skipped'] === 1,
+    'Locked MariaDB metadata check skips newly-clicked HTTP 404 and deletes stable zero-click link.');
+$expect($networkCalls['bulk-net-active'] === 2 && $networkCalls['bulk-net-stable'] === 2,
+    'Each previewed candidate has a separate pre-lock network recheck.');
+$expect((int)$pdo->query("SELECT clicks FROM yourls_url WHERE keyword='bulk-net-active'")->fetchColumn() === 1
+    && \ACh\Yourls\UrlGuard\HistoricalReview::find($bulkDB, 'bulk-net-stable') === null
+    && \ACh\Yourls\UrlGuard\HistoricalReview::find($bulkDB, 'bulk-net-already-clicked') !== null,
+    'Real database preserves newly clicked and already clicked links; stable candidate removed.');
+$expect(\ACh\Yourls\UrlGuard\BulkHistory::deleteStep($bulkDB,
+    $networkClickJob['id'], 'integration')['deleted'] === 1,
+    'Repeated completed MariaDB network deletion is inert.');
+$candidateStatuses = $bulkDB->fetchAll(
+    'SELECT keyword,result FROM yourls_ach_guard_candidates WHERE job_id = :id ORDER BY keyword',
+    ['id' => $networkClickJob['id']]
+);
+$expect($candidateStatuses === [
+    ['keyword'=>'bulk-net-active','result'=>'skipped'],
+    ['keyword'=>'bulk-net-stable','result'=>'deleted'],
+], 'Real MariaDB snapshot stores exact skipped/deleted reason outcomes.');
+\ACh\Yourls\UrlGuard\BulkHistory::clear($bulkDB, $networkClickJob['id'], 'integration');
+
+// B2: first-party admin must require explicit consent for every advertised
+// network-derived reason (not just HTTP 404/410).
+foreach (\ACh\Yourls\UrlGuard\BulkHistory::networkReasons() as $reason) {
+    $_SERVER['REQUEST_METHOD'] = 'POST';
+    $_POST = [
+        'bulk_action'=>'create','bulk_nonce'=>yourls_create_nonce('ach_url_guard_bulk'),
+        'bulk_mode'=>'page','bulk_filter'=>['reason'=>$reason],
+        'bulk_keywords'=>['bulk-net-active'],
+    ];
+    [$refusedJob,$refusal] = ach_url_guard_bulk_request($bulkDB);
+    $expect($refusedJob === null && str_contains($refusal, 'Confirm HTTP/DNS network scanning'),
+        'Missing explicit network consent refuses admin job for '.$reason);
+}
+$_SERVER['REQUEST_METHOD'] = 'GET';
+$_POST = [];
+
+// Exercise actual DNS/redirect transport policies through injectable resolver
+// and requester, never a live external provider or unsafe outbound HTTP request.
+$unsafeDnsRequests = 0;
+$privateDnsProbe = new \ACh\Yourls\UrlGuard\HttpProbe(
+    static fn(string $host): array => ['8.8.8.8','127.0.0.1'],
+    static function () use (&$unsafeDnsRequests): array {
+        $unsafeDnsRequests++;
+        return ['http_code'=>200];
+    }
+);
+$badRedirectRequests = 0;
+$badRedirectProbe = new \ACh\Yourls\UrlGuard\HttpProbe(
+    static fn(string $host): array => ['8.8.8.8'],
+    static function () use (&$badRedirectRequests): array {
+        $badRedirectRequests++;
+        return ['http_code'=>302,'location'=>"/bad\nlocation"];
+    }
+);
+foreach ([
+    'private_dns_address'=>['bulk-dns-fixture','https://example.com/dns-fixture',$privateDnsProbe],
+    'invalid_redirect'=>['bulk-redirect-fixture','https://example.com/redirect-fixture',$badRedirectProbe],
+] as $reason=>[$keyword,$url,$httpProbe]) {
+    $expect(\ACh\Yourls\UrlGuard\BulkHistory::networkMode(
+        \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason'=>$reason])),
+        'Network scan explicitly enabled for advertised '.$reason);
+    $expect(yourls_insert_link_in_db($url,$keyword,'Network reason fixture'),
+        'Insert disposable network-reason URL '.$reason);
+    $_SERVER['REQUEST_METHOD'] = 'POST';
+    $_POST = [
+        'bulk_action'=>'create','bulk_nonce'=>yourls_create_nonce('ach_url_guard_bulk'),
+        'bulk_mode'=>'page','bulk_filter'=>['reason'=>$reason],
+        'bulk_keywords'=>[$keyword], 'bulk_http_ack'=>'1',
+    ];
+    [$createdJob,$creationError] = ach_url_guard_bulk_request($bulkDB);
+    $expect($createdJob !== null && $creationError === '',
+        'Confirmed admin opt-in starts network reason job '.$reason);
+    $_SERVER['REQUEST_METHOD'] = 'GET';
+    $_POST = [];
+    $callback = static fn(string $target, array $cfg): array => $httpProbe->check($target,$cfg);
+    $createdJob = \ACh\Yourls\UrlGuard\BulkHistory::scanStep($bulkDB,
+        $createdJob['id'], 'integration', $callback);
+    $expect($createdJob['phase']==='ready' && $createdJob['matched']===1,
+        'Native MariaDB scan materializes network-only reason '.$reason);
+    $createdJob = \ACh\Yourls\UrlGuard\BulkHistory::startDeletion($bulkDB,
+        $createdJob['id'], 'integration', 'DELETE 1', true);
+    $createdJob = \ACh\Yourls\UrlGuard\BulkHistory::deleteStep($bulkDB,
+        $createdJob['id'], 'integration', $callback);
+    $expect($createdJob['phase']==='done' && $createdJob['deleted']===1
+        && \ACh\Yourls\UrlGuard\HistoricalReview::find($bulkDB,$keyword)===null,
+        'Native MariaDB deletion revalidates network reason '.$reason);
+    \ACh\Yourls\UrlGuard\BulkHistory::clear($bulkDB, $createdJob['id'], 'integration');
+}
+$expect($unsafeDnsRequests === 0,
+    'Private DNS addresses never trigger HTTP transport (real HttpProbe injected resolver).');
+$expect($badRedirectRequests === 2,
+    'Invalid redirects only fetch the original safe host, once during preview and recheck.');
+$_POST = [];
+$_SERVER['REQUEST_METHOD'] = 'GET';
+
 // Network-only historical deletion with deterministic injection and no
 // external traffic. Includes healthy, ambiguous, and confirmed missing URLs.
 $networkCases = [
