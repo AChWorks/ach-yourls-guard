@@ -2,6 +2,8 @@
 
 An independent YOURLS plugin for safer creation of **new** short links. The implementation uses the supported `shunt_add_new_link` hook rather than modifying YOURLS core or depending on a fixed internal version. Validated with PHP 8.4/8.5 syntax and offline/cURL-contract tests, and against a disposable YOURLS 1.10.6 + MariaDB installation with real HTTP API, redirects and the three existing plugin types. Independent security review and authorized Production rollout remain separate delivery gates. See [project specification](docs/PROJECT-SPEC.md).
 
+**Published packages:** [GitHub Releases](https://github.com/AChWorks/ach-yourls-guard/releases/latest). A published release does not mean it has been installed on any particular YOURLS site.
+
 **Existing short links are never automatically deleted, modified, blocked on redirect or rewritten.** The authenticated admin page can remove a reviewed individual link **or a frozen set matching explicitly approved filters**. Filtered bulk deletion does not require reviewing each link individually, but requires a complete dry-run and explicit final confirmation. Starting bulk review creates one indexed candidate table plus small job records in YOURLS options. It does not alter YOURLS core schema, admin credentials, branding, or existing plugins.
 
 ## Features
@@ -148,7 +150,7 @@ This plugin **does not** normalize the path/keyword portion of lrl.li short URLs
 
 - HTTP status is not a definitive existence/quality or safety oracle. Authentication, geo-blocking, anti-bot challenges, rate limiting and transient failures can make good sites appear unavailable.
 - Google Web Risk and DNSBL have limited list coverage and may have false positives/negatives. They cannot guarantee that a link will never trigger Google Search Console or Cloudflare warnings. Reported abuse and malicious existing links still require operational review and service-provider reconsideration.
-- The v0.2.0 candidate adds individually confirmed deletion and operator-approved filtered bulk deletion. A plugin-owned candidate table is created on the first bulk preview, and small resume/progress records are stored in YOURLS options. There is no autonomous background worker, cron, Search Console or Cloudflare integration.
+- Since v0.2.0, the plugin supports individually confirmed deletion and operator-approved filtered bulk deletion. A plugin-owned candidate table is created on the first bulk preview, and small resume/progress records are stored in YOURLS options. There is no autonomous background worker, cron, Search Console or Cloudflare integration.
 - Internationalized domain names should be supplied in standard ASCII/Punycode form. No extra composer dependencies or vendor packages are required.
 - CIDR safety checks use protocol/IANA special-purpose network assignments, independently of PHP's incomplete reserved-address flags; these safety boundaries may require maintenance when authoritative registries change.
 - HTTP redirect checking does not render JavaScript or execute a browser. JS-only redirects cannot be inferred reliably from an HTTP header.
