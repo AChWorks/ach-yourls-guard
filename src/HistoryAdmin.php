@@ -406,7 +406,8 @@ HTML;
     if ($bulkJob !== null) {
         echo '<div id="ach-bulk-live">';
         ach_url_guard_bulk_job($bulkJob);
-        echo '</div><p role="status" id="ach-bulk-poll-message"></p>';
+        echo '</div><div id="ach-bulk-pending" hidden></div>'
+            . '<p role="status" id="ach-bulk-poll-message" aria-live="polite"></p>';
         if (in_array($bulkJob['phase'], ['scan', 'delete'], true)) {
             ach_url_guard_bulk_poll_script((string) $bulkJob['id']);
         }

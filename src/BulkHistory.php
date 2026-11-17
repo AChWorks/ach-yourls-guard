@@ -208,7 +208,11 @@ final class BulkHistory
      * worker. Only the admin request handler can create a scan or authorize
      * the phase transition to deletion; this listing never performs either.
      */
-    public static function runnableJobs($db): array
+    /** Inspect the whole saved job inventory before enabling a scheduler.
+     * In particular, a legacy v0.2.2 delete-phase job was already approved
+     * and would resume once a worker is first enabled.
+     */
+    public static function jobInventory($db): array
     {
         $rows = $db->fetchAll('SELECT option_name, option_value FROM ' . self::optionsTable()
             . ' WHERE option_name LIKE :prefix ORDER BY option_id ASC',
@@ -224,17 +228,31 @@ final class BulkHistory
             $job = yourls_maybe_unserialize((string) ($row['option_value'] ?? ''));
             if (!is_array($job) || ($job['id'] ?? '') !== $id
                 || !is_string($job['owner'] ?? null) || $job['owner'] === ''
-                || !in_array($job['phase'] ?? null, ['scan', 'delete'], true)) {
+                || !in_array($job['phase'] ?? null,
+                    ['scan', 'ready', 'delete', 'done', 'paused', 'cancelled', 'error'], true)) {
                 continue;
             }
-            $active[] = ['id' => $id, 'owner' => $job['owner'], 'phase' => $job['phase']];
+            $active[] = [
+                'id' => $id, 'owner' => $job['owner'], 'phase' => (string) $job['phase'],
+                'scanned' => (int) ($job['scanned'] ?? 0),
+                'matched' => (int) ($job['matched'] ?? 0),
+                'deleted' => (int) ($job['deleted'] ?? 0),
+                'updated_at' => (string) ($job['updated_at'] ?? ''),
+            ];
         }
         return $active;
     }
 
+    public static function runnableJobs($db): array
+    {
+        return array_values(array_filter(self::jobInventory($db),
+            static fn(array $job): bool => in_array($job['phase'], ['scan', 'delete'], true)));
+    }
+
     /** Stop a failed worker job for an explicit admin retry; never retry a
      * destructive batch indefinitely or expose raw exception messages. */
-    public static function fail($db, string $id, string $owner, string $errorClass): array
+    public static function fail($db, string $id, string $owner, string $errorClass,
+        array $details = []): array
     {
         $db->beginTransaction();
         try {
@@ -244,6 +262,13 @@ final class BulkHistory
                 $job['retry_phase'] = $job['phase'];
                 $job['phase'] = 'error';
                 $job['error_class'] = preg_replace('/[^A-Za-z0-9_]/', '', str_replace('\\', '_', $errorClass));
+                $job['error_info'] = [
+                    'phase' => $job['retry_phase'],
+                    'stage' => (string) ($details['stage'] ?? 'job_step'),
+                    'code' => (string) ($details['code'] ?? ''),
+                    'occurred_at' => (string) ($details['occurred_at'] ?? gmdate('c')),
+                    'ref' => (string) ($details['ref'] ?? ''),
+                ];
                 self::save($db, $job);
             }
             $db->commit();
@@ -270,6 +295,7 @@ final class BulkHistory
                 ? $job['retry_phase'] : 'paused';
             unset($job['retry_phase']);
             $job['error_class'] = '';
+            unset($job['error_info']);
             self::save($db, $job);
             $db->commit();
             return $job;

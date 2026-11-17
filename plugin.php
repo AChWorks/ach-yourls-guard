@@ -272,7 +272,7 @@ function ach_url_guard_admin_page(): void
     echo '<main role="main" style="max-width:850px;margin:2em auto;">';
     echo '<h2>ACh URL Guard</h2>';
     echo '<p>Automatic rules apply to new links only; existing redirects remain unchanged unless an admin explicitly reviews and deletes an individual historical link.</p>';
-    echo '<p><a href="' . ach_url_guard_esc(yourls_admin_url('plugins.php?page=ach_url_guard_history')) . '">Review existing links (manual deletion only)</a></p>';
+    echo '<p><a href="' . ach_url_guard_esc(yourls_admin_url('plugins.php?page=ach_url_guard_history')) . '">Review existing links (manual single-link or explicitly approved background bulk deletion)</a></p>';
     if ($feedback !== '') {
         echo '<p class="' . (strpos($feedback, 'Invalid') === 0 ? 'error' : 'success') . '">' . ach_url_guard_esc($feedback) . '</p>';
     }

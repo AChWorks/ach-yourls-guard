@@ -14,6 +14,7 @@ tmp="$(mktemp -d "${TMPDIR:-/tmp}/ach-yourls-db-integration.XXXXXXXX")"
 chmod 700 "$tmp"
 server_pid=''
 http_pid=''
+lock_pid=''
 database_created=0
 ACH_IT_DB_NAME="ach_guard_it_$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 export ACH_IT_DB_NAME
@@ -33,6 +34,10 @@ export ACH_IT_HTTP_PORT
 cleanup() {
   local code=$?
   trap - EXIT
+  if [[ -n "$lock_pid" ]]; then
+    kill "$lock_pid" >/dev/null 2>&1 || true
+    wait "$lock_pid" >/dev/null 2>&1 || true
+  fi
   if [[ -n "$http_pid" ]]; then
     kill "$http_pid" >/dev/null 2>&1 || true
     wait "$http_pid" >/dev/null 2>&1 || true
@@ -139,6 +144,80 @@ run_php "$ACH_IT_SITE/user/plugins/ach-url-guard/bin/bulk-worker.php" --site="$A
 run_php "$repo/tests/db-phase.php" background-done
 unset ACH_IT_BG_JOB_ID
 
+# v0.2.2 serialized records omit new optional worker fields. The operator
+# must be able to inspect legacy phases before installing a scheduler.
+run_php "$repo/tests/db-phase.php" background-legacy-seed
+inspection="$(run_php "$ACH_IT_SITE/user/plugins/ach-url-guard/bin/bulk-worker.php" --site="$ACH_IT_SITE" --inspect)"
+for phase in scan ready delete; do
+  grep -q "phase=$phase .*legacy=yes" <<<"$inspection" || {
+    echo "Legacy scheduler preflight did not expose phase $phase" >&2; exit 1;
+  }
+done
+# Deliberately execute the pre-approved *disposable* legacy delete job;
+# ready jobs must remain inert, and scans must never gain delete permission.
+run_php "$ACH_IT_SITE/user/plugins/ach-url-guard/bin/bulk-worker.php" --site="$ACH_IT_SITE" --seconds=5
+run_php "$repo/tests/db-phase.php" background-legacy-verify
+echo 'PASS legacy v0.2.2 preflight: all phases inspected, only already-approved fixture deleted.'
+
+# Two independent site paths sharing the same MariaDB job namespace MUST
+# contend on the identical server-side advisory lock. A separate process
+# holds it while BOTH worker paths attempt to advance a saved scan.
+export ACH_IT_LOCK_JOB_ID="$(run_php "$repo/tests/db-phase.php" background-lock-seed)"
+cp -a "$ACH_IT_SITE" "$tmp/second-site"
+ready_file="$tmp/lock-ready"
+php "$repo/tests/worker-lock-holder.php" "$ready_file" >"$tmp/lock-holder.log" 2>&1 &
+lock_pid=$!
+for _ in {1..60}; do
+  [[ -f "$ready_file" ]] && break
+  kill -0 "$lock_pid" 2>/dev/null || break
+  sleep .1
+done
+if [[ ! -f "$ready_file" ]]; then
+  cat "$tmp/lock-holder.log" >&2
+  echo 'Disposable advisory lock was never acquired.' >&2
+  exit 1
+fi
+run_php "$ACH_IT_SITE/user/plugins/ach-url-guard/bin/bulk-worker.php" \
+  --site="$ACH_IT_SITE" --seconds=5 >"$tmp/worker-a.log" 2>&1 &
+worker_a=$!
+run_php "$tmp/second-site/user/plugins/ach-url-guard/bin/bulk-worker.php" \
+  --site="$tmp/second-site" --seconds=5 >"$tmp/worker-b.log" 2>&1 &
+worker_b=$!
+wait "$worker_a"
+wait "$worker_b"
+test ! -s "$tmp/worker-a.log" && test ! -s "$tmp/worker-b.log" || {
+  echo 'Worker did not respect cross-path shared advisory lock.' >&2; exit 1;
+}
+ACH_IT_LOCK_PHASE=scan run_php "$repo/tests/db-phase.php" background-lock-check
+kill "$lock_pid" >/dev/null 2>&1 || true
+wait "$lock_pid" >/dev/null 2>&1 || true
+lock_pid=''
+run_php "$ACH_IT_SITE/user/plugins/ach-url-guard/bin/bulk-worker.php" \
+  --site="$ACH_IT_SITE" --seconds=5 >"$tmp/worker-recovered.log" 2>&1 &
+worker_a=$!
+run_php "$tmp/second-site/user/plugins/ach-url-guard/bin/bulk-worker.php" \
+  --site="$tmp/second-site" --seconds=5 >"$tmp/worker-repeated.log" 2>&1 &
+worker_b=$!
+wait "$worker_a"
+wait "$worker_b"
+printf 'RECOVERED_WORKER_LOGS\n'
+cat "$tmp/worker-recovered.log" "$tmp/worker-repeated.log"
+ACH_IT_LOCK_PHASE=ready run_php "$repo/tests/db-phase.php" background-lock-check
+run_php "$tmp/second-site/user/plugins/ach-url-guard/bin/bulk-worker.php" \
+  --site="$tmp/second-site" --seconds=5
+ACH_IT_LOCK_PHASE=ready run_php "$repo/tests/db-phase.php" background-lock-check
+unset ACH_IT_LOCK_JOB_ID
+echo 'PASS cross-path MariaDB lock contention, worker crash recovery and repeated cron runs.'
+
+# Prepare three separate real HTTP login/approval fixtures; the public and
+# private server modes must use real browser-like cookies and POSTs.
+export ACH_IT_HTTP_PRIVATE_ID="$(ACH_IT_HTTP_LABEL=private run_php "$repo/tests/db-phase.php" background-http-seed)"
+export ACH_IT_HTTP_PUBLIC_ID="$(ACH_IT_HTTP_LABEL=public run_php "$repo/tests/db-phase.php" background-http-seed)"
+export ACH_IT_HTTP_OTHER_ID="$(ACH_IT_HTTP_LABEL=other run_php "$repo/tests/db-phase.php" background-http-seed)"
+export ACH_IT_HTTP_STALE_PRIVATE_ID="$(ACH_IT_HTTP_LABEL=stale-private run_php "$repo/tests/db-phase.php" background-http-seed)"
+export ACH_IT_HTTP_STALE_PUBLIC_ID="$(ACH_IT_HTTP_LABEL=stale-public run_php "$repo/tests/db-phase.php" background-http-seed)"
+export ACH_IT_LOGIN_NONCE="$(run_php "$repo/tests/db-phase.php" login-nonce)"
+
 # The opt-in historical audit is required to be read-only, including options/events.
 before="$(run_php "$repo/tests/db-phase.php" snapshot)"
 run_php "$repo/bin/audit.php" --site="$ACH_IT_SITE" --limit=200 >"$tmp/audit.csv" 2>"$tmp/audit.log"
@@ -150,6 +229,9 @@ if [[ "$before" != "$after" ]] || ! grep -q '^keyword,status,reason,destination'
 fi
 echo 'PASS read-only historical audit: CSV and full database state unchanged.'
 
+# Shared native YOURLS session is generated by private-mode HTTP login,
+# then reused across the public-mode restart (no fake auth filters).
+export ACH_IT_TEST_COOKIE_FILE="$tmp/yourls-auth-cookie"
 # The native PHP HTTP entry points and actual redirects are checked over loopback.
 cat >"$tmp/router.php" <<'ROUTER'
 <?php
@@ -207,6 +289,7 @@ if ! run_php "$repo/tests/http-integration.php" verify-public; then
   exit 1
 fi
 
+run_php "$repo/tests/db-phase.php" background-http-check
 # Prove admission works across distinct PHP processes with the real YOURLS
 # native flood policy enabled. Never call external HTTP/provider services.
 gate_before="$(run_php "$repo/tests/db-phase.php" snapshot)"

@@ -120,6 +120,11 @@ function ach_url_guard_bulk_job(array $job): void
         } else {
             echo '<p>Previously confirmed deletion is in progress. Cancel stops subsequent batches,'
                 . ' but cannot restore links already deleted.</p>';
+            if (empty($job['updated_at'])) {
+                echo '<p role="status"><strong>Legacy delete-phase job:</strong> This approval'
+                    . ' predates the background worker. Enabling the scheduler will resume'
+                    . ' already-confirmed deletion. Cancel this job first if it should not resume.</p>';
+            }
         }
         if ($last === 0 || time() - $last > 120) {
             echo '<p role="status" class="error"><strong>Worker not recently active.</strong>'
@@ -158,6 +163,12 @@ function ach_url_guard_bulk_job(array $job): void
         }
         ach_url_guard_bulk_action_form('cancel', $id, 'Cancel without deleting');
     } elseif ($phase === 'error') {
+        $info = is_array($job['error_info'] ?? null) ? $job['error_info'] : [];
+        echo '<p>Failed stage: <code>' . ach_url_guard_esc((string) ($info['stage'] ?? 'job_step'))
+            . '</code>; UTC: <code>' . ach_url_guard_esc((string) ($info['occurred_at'] ?? 'unknown'))
+            . '</code>; code: <code>' . ach_url_guard_esc((string) ($info['code'] ?? 'unknown'))
+            . '</code>; log reference: <code>' . ach_url_guard_esc((string) ($info['ref'] ?? 'unavailable'))
+            . '</code>.</p>';
         echo '<p role="alert">The server worker stopped after an error ('
             . ach_url_guard_esc($job['error_class'] ?? 'unavailable')
             . '). No background processing will continue until an admin retries.'
@@ -225,28 +236,111 @@ function ach_url_guard_bulk_ajax_status(): void
     }
 }
 
-/** Updates only the job card; never reloads/submits the whole admin page. */
+/** Render progress without reloading. If controls have keyboard focus,
+ * preserve the focused DOM and display a terminal result in a sibling card;
+ * never make the ready/error/done state invisible due to deferred replacement.
+ */
 function ach_url_guard_bulk_poll_script(string $id): void
 {
     $endpoint = yourls_admin_url('admin-ajax.php?action=ach_guard_bulk_status&job='
         . rawurlencode($id));
-    echo '<script>(function(){'
-        . 'var box=document.getElementById("ach-bulk-live");if(!box)return;'
-        . 'var endpoint=' . json_encode($endpoint, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_QUOT | JSON_HEX_APOS)
-        . ';var signature="",failures=0;'
-        . 'var message=document.getElementById("ach-bulk-poll-message");'
-        . 'function again(delay){setTimeout(poll,delay||3000)}'
-        . 'function poll(){fetch(endpoint,{credentials:"same-origin",cache:"no-store"})'
-        . '.then(function(r){if(!r.ok)throw new Error("status "+r.status);return r.json()})'
-        . '.then(function(d){if(!d.ok||typeof d.html!=="string")throw new Error("invalid status");'
-        . 'failures=0;if(message)message.textContent="";'
-        . 'var next=[d.phase,d.updated,d.stale,d.scanned,d.matched,d.processed,d.deleted,d.skipped].join("|");'
-        . 'if(next!==signature&&!box.contains(document.activeElement)){box.innerHTML=d.html;signature=next;}'
-        . 'if(d.phase==="scan"||d.phase==="delete"){again()}})'
-        . '.catch(function(){failures++;if(message)message.textContent='
-        . '"Live progress is unavailable; reconnecting automatically. The server job is saved.";'
-        . 'again(Math.min(30000,3000*Math.pow(2,Math.min(failures,4))))})}'
-        . 'poll()})();</script>';
+    echo '<script>(function () { const endpoint = '
+        . json_encode($endpoint, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_QUOT | JSON_HEX_APOS)
+        . ';' . "\n";
+    echo <<<'SCRIPT'
+    const box = document.getElementById("ach-bulk-live");
+    const pending = document.getElementById("ach-bulk-pending");
+    const message = document.getElementById("ach-bulk-poll-message");
+    if (!box || !pending) return;
+    let rendered = "", deferred = null, stopped = false, failures = 0;
+    const terminal = phase => !["scan", "delete"].includes(phase);
+    const containsFocus = element => element.contains(document.activeElement);
+    const announce = text => { if (message) message.textContent = text; };
+
+    function afterFocusLeaves() {
+        setTimeout(() => {
+            if (containsFocus(box)) return;
+            if (!pending.hidden) {
+                // The new terminal card is already visible. Never replace it:
+                // it may contain a filled DELETE N form or focused controls.
+                box.hidden = true;
+            } else if (deferred !== null) {
+                box.innerHTML = deferred.html;
+                rendered = deferred.signature;
+                deferred = null;
+            }
+        }, 0);
+    }
+    box.addEventListener("focusout", afterFocusLeaves);
+
+    function draw(data) {
+        const signature = [data.phase, data.updated, data.stale,
+            data.scanned, data.matched, data.processed, data.deleted,
+            data.skipped].join("|");
+        if (signature === rendered) return;
+        const isTerminal = terminal(data.phase);
+        if (containsFocus(box)) {
+            if (isTerminal) {
+                // A focused old control must not block delivery of READY,
+                // ERROR, PAUSED or DONE. Display the complete new state now.
+                pending.innerHTML = data.html;
+                pending.hidden = false;
+                deferred = null;
+                announce("Job status changed to " + data.phase
+                    + ". Updated controls are visible below.");
+            } else {
+                // Keep the focused control stable and update read-only counts.
+                deferred = {html: data.html, signature};
+                announce(data.phase + ": " + data.scanned + " scanned, "
+                    + data.matched + " matched, " + data.deleted + " deleted.");
+            }
+        } else if (pending.hidden) {
+            box.innerHTML = data.html;
+            rendered = signature;
+            deferred = null;
+            announce("");
+        }
+    }
+
+    function again(delay = 3000) {
+        if (!stopped) setTimeout(poll, delay);
+    }
+    async function poll() {
+        if (stopped) return;
+        try {
+            const response = await fetch(endpoint, {
+                credentials: "same-origin", cache: "no-store",
+                headers: {"Accept": "application/json"}
+            });
+            const contentType = response.headers.get("content-type") || "";
+            if ([401, 403].includes(response.status) || response.redirected
+                || (response.ok && !contentType.includes("json"))) {
+                stopped = true;
+                announce("Login expired. Sign in to YOURLS and reopen the saved job.");
+                return;
+            }
+            if (response.status === 404) {
+                stopped = true;
+                announce("This job is no longer accessible. Open Recent saved jobs.");
+                return;
+            }
+            if (!response.ok) throw new Error("status " + response.status);
+            const data = await response.json();
+            if (!data.ok || typeof data.html !== "string") throw new Error("invalid status");
+            failures = 0;
+            draw(data);
+            if (!terminal(data.phase)) again();
+        } catch (_) {
+            failures++;
+            announce("Live progress is unavailable; reconnecting automatically. "
+                + "The server job remains saved.");
+            again(Math.min(30000, 3000 * Math.pow(2, Math.min(failures, 4))));
+        }
+    }
+    poll();
+})();
+</script>
+SCRIPT;
 }
 
 function ach_url_guard_bulk_recent_jobs($db): void

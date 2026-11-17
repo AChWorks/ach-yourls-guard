@@ -20,6 +20,7 @@ use ACh\Yourls\UrlGuard\HistoricalReview;
 final class BulkSqlite
 {
     private PDO $pdo;
+    public bool $injectReadFailure = false;
     public function __construct()
     {
         $this->pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
@@ -43,6 +44,10 @@ final class BulkSqlite
     }
     public function fetchAll(string $sql, array $binds = []): array
     {
+        if ($this->injectReadFailure
+            && str_contains($sql, 'SELECT keyword,url,title,timestamp,clicks FROM')) {
+            throw new PDOException('https://example.com/private?token=DO_NOT_LOG password=DO_NOT_LOG');
+        }
         return $this->prep($sql, $binds)->fetchAll(PDO::FETCH_ASSOC);
     }
     public function fetchOne(string $sql, array $binds = []): array|false
@@ -398,6 +403,60 @@ $paused = BulkHistory::retry($db, $policyFailure['id'], 'fixture-admin');
 assertBulk($paused['phase'] === 'paused' && BulkHistory::runnableJobs($db) === [],
     'changed policy blocks retry and requires a new dry-run');
 BulkHistory::clear($db, $policyFailure['id'], 'fixture-admin');
+
+// Lock identity must match for different filesystem paths sharing one
+// database schema and differ across independent database namespaces.
+$lock = \ACh\Yourls\UrlGuard\HistoryWorker::lockName('db-site-a', 'yourls_');
+assertBulk($lock === \ACh\Yourls\UrlGuard\HistoryWorker::lockName('db-site-a', 'yourls_')
+    && $lock !== \ACh\Yourls\UrlGuard\HistoryWorker::lockName('db-site-b', 'yourls_')
+    && strlen($lock) <= 64,
+    'MySQL lock name is schema/prefix scoped, not local-path scoped');
+
+// Fault injection: diagnose a failed persisted job with a private structured
+// event, without serializing/logging secret exception messages.
+$failedJob = BulkHistory::create($db, 'fixture-admin', 'all',
+    BulkHistory::filter(['reason' => 'any']), []);
+$logPath = tempnam(sys_get_temp_dir(), 'ach-bg-worker-errors-');
+assertBulk(is_string($logPath), 'Private log target available');
+$previousLog = ini_get('error_log');
+$previousLogging = ini_get('log_errors');
+ini_set('error_log', $logPath);
+ini_set('log_errors', '1');
+$db->injectReadFailure = true;
+try {
+    $failureRun = HistoryWorker::run($db, 1);
+} finally {
+    $db->injectReadFailure = false;
+    ini_set('error_log', (string) $previousLog);
+    ini_set('log_errors', (string) $previousLogging);
+}
+$failedState = BulkHistory::load($db, $failedJob['id'], 'fixture-admin');
+$privateLog = (string) file_get_contents($logPath);
+@unlink($logPath);
+assertBulk($failureRun['failures'] === 1 && $failureRun['steps'] === 0
+    && $failedState['phase'] === 'error'
+    && ($failedState['error_info']['phase'] ?? '') === 'scan'
+    && ($failedState['error_info']['stage'] ?? '') === 'scan_step'
+    && ($failedState['error_info']['code'] ?? '') === '0'
+    && preg_match('/^[a-f0-9]{16}$/D', (string) ($failedState['error_info']['ref'] ?? ''))
+    && $failedState['error_class'] === 'PDOException',
+    'Controlled worker read failure persists safe stage/category/code/UTC/correlation ID');
+assertBulk(str_contains($privateLog, '"job_id":"' . $failedJob['id'] . '"')
+    && str_contains($privateLog, '"stage":"scan_step"')
+    && str_contains($privateLog, '"category":"PDOException"')
+    && !str_contains($privateLog, 'DO_NOT_LOG')
+    && !str_contains($privateLog, 'https://example.com')
+    && !str_contains(serialize($failedState), 'DO_NOT_LOG'),
+    'Private logs identify failure without URLs, credentials or exception message');
+assertBulk(BulkHistory::runnableJobs($db) === [],
+    'Failed job is not silently retried by another scheduler invocation');
+$recovered = BulkHistory::retry($db, $failedJob['id'], 'fixture-admin');
+assertBulk($recovered['phase'] === 'scan'
+    && !array_key_exists('error_info', $recovered),
+    'Owner-initiated retry clears the error and retains the original cursor');
+BulkHistory::cancel($db, $failedJob['id'], 'fixture-admin');
+BulkHistory::clear($db, $failedJob['id'], 'fixture-admin');
+
 assertBulk($checks > 65, 'background job assertions ran');
 
 echo 'PASS '.$checks.' bulk selection/filter/snapshot/chunk/cancel/network-state assertions in disposable SQLite'.PHP_EOL;

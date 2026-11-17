@@ -14,9 +14,9 @@ if (PHP_SAPI !== 'cli') {
     exit;
 }
 
-$options = getopt('', ['site:', 'seconds:', 'help']);
+$options = getopt('', ['site:', 'seconds:', 'inspect', 'help']);
 if (isset($options['help'])) {
-    fwrite(STDOUT, "Usage: php bin/bulk-worker.php [--site=/path/to/yourls] [--seconds=45]\n");
+    fwrite(STDOUT, "Usage: php bin/bulk-worker.php [--site=/path/to/yourls] [--seconds=45] [--inspect]\n");
     exit(0);
 }
 $site = realpath($options['site'] ?? dirname(__DIR__, 4));
@@ -45,10 +45,27 @@ if (!function_exists('yourls_is_active_plugin')
 
 try {
     $db = yourls_get_db('write-ach_guard_bulk_worker');
-    // MariaDB/MySQL advisory lock is connection-scoped, survives transactions,
-    // and is automatically released on worker failure. Multiple cron invocations
-    // or hosts must never process a deletion job concurrently.
-    $lockName = 'ach_guard_bulk_' . substr(hash('sha256', $site), 0, 40);
+    if (isset($options['inspect'])) {
+        $jobs = \ACh\Yourls\UrlGuard\BulkHistory::jobInventory($db);
+        fwrite(STDOUT, 'Saved bulk jobs: ' . count($jobs) . "\n");
+        $pendingDelete = 0;
+        foreach ($jobs as $job) {
+            // Report only IDs, phases and counts, never destinations or proofs.
+            fwrite(STDOUT, sprintf("job=%s phase=%s scanned=%d matched=%d deleted=%d%s\n",
+                $job['id'], $job['phase'], $job['scanned'], $job['matched'],
+                $job['deleted'], $job['updated_at'] === '' ? ' legacy=yes' : ''));
+            if ($job['phase'] === 'delete') $pendingDelete++;
+        }
+        if ($pendingDelete > 0) {
+            fwrite(STDERR, "WARNING: $pendingDelete previously approved deletion job(s) "
+                . "will resume if the worker is enabled. Inspect/cancel before scheduling.\n");
+        }
+        exit(0);
+    }
+    // MariaDB/MySQL advisory locks are connection-scoped and shared by
+    // independent hosts connected to the same database workload. Local paths
+    // MUST NOT be used in the lock identity.
+    $lockName = HistoryWorker::lockName(YOURLS_DB_NAME, YOURLS_DB_PREFIX);
     $lock = $db->fetchOne('SELECT GET_LOCK(:name, 0) AS acquired', ['name' => $lockName]);
     if (!is_array($lock) || (int) ($lock['acquired'] ?? 0) !== 1) {
         // Another scheduler invocation is already running; do not enqueue a duplicate.

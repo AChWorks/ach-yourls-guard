@@ -433,8 +433,10 @@ check(str_contains($readyUI, 'DELETE 2217')
 ob_start();ach_url_guard_bulk_poll_script($jobUi['id']);$pollJS=ob_get_clean();
 check(str_contains($pollJS, 'admin-ajax.php?action=ach_guard_bulk_status')
     && str_contains($pollJS, 'fetch(endpoint')
-    && str_contains($pollJS, 'box.innerHTML=d.html')
-    && str_contains($pollJS, 'd.stale')
+    && str_contains($pollJS, 'box.innerHTML = data.html')
+    && str_contains($pollJS, 'pending.innerHTML = data.html')
+    && str_contains($pollJS, 'box.addEventListener("focusout"')
+    && str_contains($pollJS, 'data.stale')
     && str_contains($pollJS, 'reconnecting automatically')
     && !str_contains($pollJS, 'location.reload(')
     && !str_contains($pollJS, 'form.submit('),
@@ -442,10 +444,23 @@ check(str_contains($pollJS, 'admin-ajax.php?action=ach_guard_bulk_status')
 $jobUi['phase']='error';
 $jobUi['retry_phase']='scan';
 $jobUi['error_class']='PDOException';
+$jobUi['error_info'] = [
+    'stage'=>'scan_step', 'occurred_at'=>'2026-11-17T12:00:00Z',
+    'code'=>'HY000', 'ref'=>'1234567890abcdef',
+];
 ob_start();ach_url_guard_bulk_job($jobUi);$errorUI=ob_get_clean();
 check(str_contains($errorUI, 'Retry background processing')
-    && str_contains($errorUI, 'No background processing will continue until an admin retries.'),
-    'server worker failure is recoverable with explicit user retry');
+    && str_contains($errorUI, 'No background processing will continue until an admin retries.')
+    && str_contains($errorUI, 'scan_step')
+    && str_contains($errorUI, '1234567890abcdef')
+    && str_contains($errorUI, 'HY000'),
+    'server worker error card gives safe stage/code/correlation context');
+$jobUi['phase']='delete';
+unset($jobUi['updated_at']);
+ob_start();ach_url_guard_bulk_job($jobUi);$legacyUI=ob_get_clean();
+check(str_contains($legacyUI, 'Legacy delete-phase job:')
+    && str_contains($legacyUI, 'Enabling the scheduler will resume'),
+    'legacy pending destructive job has explicit operator warning');
 
 check(in_array('ach_url_guard_history_delete', $nonceActions, true), 'delete nonce checked');
 

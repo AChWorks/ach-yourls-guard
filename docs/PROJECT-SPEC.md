@@ -59,8 +59,13 @@ redirects and customer data.
   plugin table, plus small owner-bound progress records in YOURLS options.
   Require a typed count and checkbox to confirm permanent deletion; support
   restartable keyset batches, stop, progress and saved resume link. The
-  operator may separately configure a host-local CLI/cron worker for the
-  existing authenticated, explicitly started jobs; scanning must continue
+  operator may separately configure a host-local CLI/cron worker for
+  authenticated, explicitly started jobs after a read-only saved-job inventory.
+  Existing v0.2.2 delete-phase jobs represent **previously confirmed**
+  destructive work and will resume upon enabling cron; inspect/cancel any
+  unintended delete jobs first without erasing their snapshots or metadata.
+  A legacy scan resumes scanning only, while ready still needs separate
+  exact-delete authorization. Scanning must continue
   safely when the admin browser closes and the UI must poll read-only state
   in place rather than full-page self-reloading. Background deletion is
   allowed **only after** exact typed DELETE N, checkbox and nonce
