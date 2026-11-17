@@ -136,6 +136,30 @@ final class HistoricalReview
         return hash_hmac('sha256', serialize($identity), (string) YOURLS_COOKIEKEY);
     }
 
+    /** Lock the authoritative stored policy too; a cached YOURLS option may be stale. */
+    private static function lockedSettings($db): array
+    {
+        $table = (string) YOURLS_DB_TABLE_OPTIONS;
+        if (!preg_match('/^[a-zA-Z0-9_]+$/D', $table)) {
+            throw new \RuntimeException('Invalid YOURLS options table identifier');
+        }
+        $rows = $db->fetchAll(
+            'SELECT option_value FROM ' . $table . ' WHERE option_name = :name FOR UPDATE',
+            ['name' => 'ach_url_guard_settings']
+        );
+        if ($rows === []) {
+            return Policy::settings([]);
+        }
+        if (count($rows) !== 1) {
+            throw new \RuntimeException('Ambiguous YOURLS Guard settings rows');
+        }
+        $raw = yourls_maybe_unserialize((string) $rows[0]['option_value']);
+        if (!is_array($raw)) {
+            throw new \RuntimeException('Invalid YOURLS Guard settings data');
+        }
+        return Policy::settings($raw);
+    }
+
     /** Keep URL paths, credentials and query parameters out of the review UI. */
     public static function hostLabel(string $url): string
     {
@@ -177,13 +201,17 @@ final class HistoricalReview
             $db->beginTransaction();
             try {
                 $locked = self::find($db, $keyword, true);
-                if ($locked === null || !hash_equals(self::proof($locked, $settings), $expectedProof)) {
+                // A second administrator may have changed rules while this
+                // request was doing network I/O. Re-read/lock the stored
+                // option instead of trusting this request's cached option.
+                $currentPolicy = self::lockedSettings($db);
+                if ($locked === null || !hash_equals(self::proof($locked, $currentPolicy), $expectedProof)) {
                     $db->rollBack();
                     return 'stale';
                 }
                 // Fast local policies can be verified while the row is locked.
                 // Network results were rechecked immediately before the lock.
-                $local = self::inspect($locked, $settings, false);
+                $local = self::inspect($locked, $currentPolicy, false);
                 if (!$network && ($local['status'] !== 'deny' || $local['reason'] !== $expectedReason)) {
                     $db->rollBack();
                     return 'no_longer_flagged';

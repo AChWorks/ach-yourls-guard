@@ -5,6 +5,7 @@ declare(strict_types=1);
 // No credentials, external network calls, or real YOURLS database are used.
 define('YOURLS_ABSPATH', __DIR__);
 define('YOURLS_DB_TABLE_URL', 'yourls_url');
+define('YOURLS_DB_TABLE_OPTIONS', 'yourls_options');
 define('YOURLS_COOKIEKEY', 'history-review-local-test-secret');
 
 final class FakeHistoryDB
@@ -13,9 +14,13 @@ final class FakeHistoryDB
     private array $snapshot = [];
     private bool $transaction = false;
     public int $deletes = 0;
+    public ?array $settingsRaw = ['mode' => 'enforce'];
 
     public function fetchAll(string $query, array $binds): array
     {
+        if (array_key_exists('name', $binds) && $binds['name'] === 'ach_url_guard_settings') {
+            return $this->settingsRaw === null ? [] : [['option_value' => serialize($this->settingsRaw)]];
+        }
         if (strpos($query, 'ORDER BY keyword ASC LIMIT ') === false
             || !preg_match('/LIMIT ([0-9]+)$/D', $query, $match)) {
             throw new RuntimeException('Unexpected scan query');
@@ -84,6 +89,7 @@ function yourls_verify_nonce($action, $nonce = false): bool {
     return true;
 }
 function yourls_admin_url($path = ''): string {return 'https://short.example/admin/' . $path;}
+function yourls_maybe_unserialize($value) {return @unserialize((string) $value, ['allowed_classes' => false]);}
 function yourls_delete_link_by_keyword($keyword): int {
     global $db;
     if (!isset($db->rows[$keyword])) return 0;
@@ -170,6 +176,11 @@ $db->rows['bad']['url'] = 'https://example.com/safe-path';
 check(HistoricalReview::delete($db, 'bad', $proof, 'blocked_domain', false, $settings) === 'stale',
     'destination changed after preview prevents deletion');
 $db->rows['bad'] = $bad;
+$db->settingsRaw = ['mode' => 'enforce', 'blocked_domains' => []];
+check(HistoricalReview::delete($db, 'bad', $proof, 'blocked_domain', false, $settings) === 'stale',
+    'current stored policy change cancels deletion even when request had cached old rules');
+check(isset($db->rows['bad']), 'concurrent policy update preserves historical link');
+$db->settingsRaw = ['mode' => 'enforce'];
 
 $_SERVER['REQUEST_METHOD'] = 'POST';
 $_POST = [

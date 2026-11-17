@@ -309,6 +309,20 @@ $updateHistory->execute([$originalTitle, $historyName]);
 $marked = \ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName);
 $reviewProof = \ACh\Yourls\UrlGuard\HistoricalReview::proof($marked, $historyPolicy);
 
+// A concurrent admin policy save can outlive this PHP request's cached option.
+// Change only the disposable database's policy option and verify fresh SQL
+// inside the locked delete transaction rejects an obsolete approval.
+$policyUpdate = $pdo->prepare('UPDATE yourls_options SET option_value = ? WHERE option_name = ?');
+$modifiedPolicy = $saved;
+$modifiedPolicy['blocked_domains'] = [];
+$policyUpdate->execute([serialize($modifiedPolicy), 'ach_url_guard_settings']);
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::delete($historyDB, $historyName,
+    $reviewProof, 'blocked_domain', false, $historyPolicy) === 'stale',
+    'Concurrent stored policy change must cancel cached-policy deletion.');
+$expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($historyDB, $historyName) !== null,
+    'Link survives concurrent policy changes.');
+$policyUpdate->execute([serialize($saved), 'ach_url_guard_settings']);
+
 $cleanPolicy = $historyPolicy;
 $cleanPolicy['blocked_domains'] = [];
 $expect(\ACh\Yourls\UrlGuard\HistoricalReview::delete($historyDB, $historyName,
