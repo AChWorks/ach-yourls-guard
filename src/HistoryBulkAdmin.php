@@ -345,22 +345,55 @@ SCRIPT;
 
 function ach_url_guard_bulk_recent_jobs($db): void
 {
+    echo '<section aria-label="Recover saved bulk review jobs"><h3>Saved review jobs</h3>';
+    echo '<p>Jobs are private to the YOURLS account that created them.'
+        . ' An operator can provide the exact job ID from the host-local'
+        . ' worker <code>--inspect</code> command to its original owner.</p>';
+    echo '<form method="get">';
+    echo ach_url_guard_history_hidden('page', 'ach_url_guard_history');
+    echo '<label for="ach-bulk-open-job">Open your job by exact ID: '
+        . '<input id="ach-bulk-open-job" name="bulk_job" type="text"'
+        . ' pattern="[0-9a-f]{24}" maxlength="24" autocomplete="off" required /></label> ';
+    echo '<button type="submit" class="button">Open saved job</button></form>';
     try {
         $jobs = BulkHistory::recentJobs($db, BulkHistory::actor());
-        if ($jobs === []) return;
-        echo '<section aria-label="Resume prior bulk review jobs"><h3>Recent saved jobs</h3><ul>';
-        foreach ($jobs as $job) {
-            $url = yourls_admin_url('plugins.php?page=ach_url_guard_history&bulk_job='
-                . rawurlencode($job['id']));
-            echo '<li><a href="' . ach_url_guard_esc($url) . '">'
-                . ach_url_guard_esc($job['phase']) . ' — '
-                . (int) $job['matched'] . ' matched, ' . (int) $job['deleted']
-                . ' deleted</a></li>';
+        $delete = array_values(array_filter($jobs,
+            static fn(array $job): bool => $job['phase'] === 'delete'));
+        $other = array_values(array_filter($jobs,
+            static fn(array $job): bool => $job['phase'] !== 'delete'));
+        if ($delete !== []) {
+            echo '<h4>Previously approved deletion jobs — review before enabling cron</h4>';
+            echo '<p>All active deletion jobs belonging to this account are listed here,'
+                . ' including jobs older than the recent list.'
+                . ' Open an unwanted job and select Cancel before enabling the worker.'
+                . ' Already deleted links cannot be recovered by cancellation.</p>';
+            ach_url_guard_bulk_job_links($delete);
         }
-        echo '</ul></section>';
+        if ($other !== []) {
+            echo '<h4>Recent saved jobs</h4>';
+            ach_url_guard_bulk_job_links($other);
+        }
+        if ($jobs === []) echo '<p>No saved jobs are currently visible for this account.</p>';
     } catch (Throwable $error) {
         error_log('ACh URL Guard recent job list failed [' . get_class($error) . ']');
+        echo '<p class="error">Could not load saved jobs. No data was changed.</p>';
     }
+    echo '</section>';
+}
+
+/** Links only to owner-scoped job lookup; never exposes destination URLs. */
+function ach_url_guard_bulk_job_links(array $jobs): void
+{
+    echo '<ul>';
+    foreach ($jobs as $job) {
+        $url = yourls_admin_url('plugins.php?page=ach_url_guard_history&bulk_job='
+            . rawurlencode($job['id']));
+        echo '<li><a href="' . ach_url_guard_esc($url) . '">'
+            . ach_url_guard_esc($job['phase']) . ' — '
+            . (int) $job['matched'] . ' matched, ' . (int) $job['deleted']
+            . ' deleted</a> <code>' . ach_url_guard_esc($job['id']) . '</code></li>';
+    }
+    echo '</ul>';
 }
 
 /** Form fields are associated with table-row checkboxes using form= attribute. */

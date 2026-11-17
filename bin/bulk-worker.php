@@ -51,9 +51,14 @@ try {
         $pendingDelete = 0;
         foreach ($jobs as $job) {
             // Report only IDs, phases and counts, never destinations or proofs.
-            fwrite(STDOUT, sprintf("job=%s phase=%s scanned=%d matched=%d deleted=%d%s\n",
-                $job['id'], $job['phase'], $job['scanned'], $job['matched'],
-                $job['deleted'], $job['updated_at'] === '' ? ' legacy=yes' : ''));
+            // Quote owner identities to preserve whitespace and escape control
+            // characters. Output stays host-local, never an HTTP response.
+            $owner = json_encode($job['owner'], JSON_UNESCAPED_UNICODE
+                | JSON_INVALID_UTF8_SUBSTITUTE);
+            fwrite(STDOUT, sprintf("job=%s owner=%s phase=%s scanned=%d matched=%d deleted=%d%s\n",
+                $job['id'], $owner, $job['phase'], $job['scanned'],
+                $job['matched'], $job['deleted'],
+                $job['updated_at'] === '' ? ' legacy=yes' : ''));
             if ($job['phase'] === 'delete') $pendingDelete++;
         }
         if ($pendingDelete > 0) {

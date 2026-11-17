@@ -457,6 +457,69 @@ assertBulk($recovered['phase'] === 'scan'
 BulkHistory::cancel($db, $failedJob['id'], 'fixture-admin');
 BulkHistory::clear($db, $failedJob['id'], 'fixture-admin');
 
+
+// N1: global newest-30 LIMIT must never hide an older approved delete job,
+// even if 36 newer jobs belong to each of two different administrators.
+$makeSavedJob = static function (string $owner, string $phase) use ($db): string {
+    $id = bin2hex(random_bytes(12));
+    $saved = [
+        'id' => $id, 'owner' => $owner, 'phase' => $phase,
+        'matched' => 1, 'deleted' => 0, 'scanned' => 1,
+        'updated_at' => '', // old v0.2.2 compatible format
+    ];
+    $db->fetchAffected('INSERT INTO yourls_options (option_name,option_value)'
+        . ' VALUES (:key,:value)', [
+        'key' => 'ach_url_guard_bulk_' . $id, 'value' => serialize($saved),
+    ]);
+    return $id;
+};
+$oldOwned = $makeSavedJob('fixture-admin', 'delete');
+$oldOther = $makeSavedJob('another-admin', 'delete');
+$oldUnavailable = $makeSavedJob('inactive-owner', 'delete');
+for ($i = 0; $i < 36; $i++) {
+    $makeSavedJob('fixture-admin', 'scan');
+    $makeSavedJob('another-admin', 'ready');
+}
+$owned = BulkHistory::recentJobs($db, 'fixture-admin');
+$otherOwned = BulkHistory::recentJobs($db, 'another-admin');
+assertBulk(count($owned) === 31 && count($otherOwned) === 31,
+    'newest 30 per owner plus every older deletion, regardless of global recency');
+assertBulk(in_array($oldOwned, array_column($owned, 'id'), true)
+    && in_array($oldOther, array_column($otherOwned, 'id'), true),
+    'both active delete jobs remain visible to their respective original owners');
+assertBulk(!in_array($oldOther, array_column($owned, 'id'), true)
+    && !in_array($oldUnavailable, array_column($owned, 'id'), true)
+    && !in_array($oldOwned, array_column($otherOwned, 'id'), true),
+    'other owners cannot enumerate active deletion jobs');
+assertBulk(count(BulkHistory::recentJobs($db, 'inactive-owner')) === 1,
+    'unavailable owner job is retained for the host operator inventory');
+$inventory = BulkHistory::jobInventory($db);
+$all = array_column($inventory, null, 'id');
+assertBulk($all[$oldOwned]['owner'] === 'fixture-admin'
+    && $all[$oldOther]['owner'] === 'another-admin'
+    && $all[$oldUnavailable]['owner'] === 'inactive-owner'
+    && $all[$oldOwned]['phase'] === 'delete',
+    'read-only host inventory carries exact owning identity and job phase');
+$wrongCancel = false;
+try {
+    BulkHistory::cancel($db, $oldOther, 'fixture-admin');
+} catch (RuntimeException $error) {
+    $wrongCancel = true;
+}
+assertBulk($wrongCancel
+    && BulkHistory::load($db, $oldOther, 'another-admin')['phase'] === 'delete',
+    'non-owner cannot cancel older delete-phase job');
+$ownedCancel = BulkHistory::cancel($db, $oldOwned, 'fixture-admin');
+$otherCancel = BulkHistory::cancel($db, $oldOther, 'another-admin');
+assertBulk($ownedCancel['phase'] === 'cancelled'
+    && $otherCancel['phase'] === 'cancelled'
+    && BulkHistory::load($db, $oldUnavailable, 'inactive-owner')['phase'] === 'delete',
+    'original owners can cancel; unavailable account remains a documented cron blocker');
+assertBulk(!in_array($oldOwned, array_column(
+    array_filter(BulkHistory::recentJobs($db, 'fixture-admin'),
+        static fn(array $job): bool => $job['phase'] === 'delete'), 'id'), true),
+    'cancelled legacy deletion is no longer shown as pending destructive work');
+
 assertBulk($checks > 65, 'background job assertions ran');
 
 echo 'PASS '.$checks.' bulk selection/filter/snapshot/chunk/cancel/network-state assertions in disposable SQLite'.PHP_EOL;

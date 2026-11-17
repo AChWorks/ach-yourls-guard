@@ -9,7 +9,8 @@ $phase = $argv[1] ?? '';
 if (!in_array($phase, ['ping', 'create', 'install', 'verify', 'snapshot', 'drop', 'gate',
     'login-nonce', 'background-seed', 'background-ready', 'background-approve', 'background-done',
     'background-http-seed', 'background-http-check', 'background-legacy-seed',
-    'background-legacy-verify', 'background-lock-seed', 'background-lock-check'], true)) {
+    'background-legacy-verify', 'background-lock-seed', 'background-lock-check',
+    'background-recovery-seed', 'background-recovery-discover', 'background-recovery-verify'], true)) {
     fwrite(STDERR, "Expected ping|create|install|verify|snapshot|drop.\n");
     exit(2);
 }
@@ -230,6 +231,95 @@ if ($phase === 'background-lock-check') {
     $expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($bulk,'lock-fixture')!==null,
         'No lock test may delete fixture URL');
     echo "PASS shared DB worker lock state: " . $want . ".\n";
+    exit(0);
+}
+
+// N1: multi-owner pre-cron recovery, with a genuine frozen candidate snapshot
+// for each old delete job. All data belongs to this disposable database.
+if ($phase === 'background-recovery-seed') {
+    $bulk = yourls_get_db('write-ach_guard_recovery_seed');
+    $ids = [];
+    foreach ([
+        'integration' => 'recovery-own',
+        'other-operator' => 'recovery-other',
+        'unavailable-owner' => 'recovery-missing',
+    ] as $owner => $keyword) {
+        $expect(yourls_insert_link_in_db(
+            'https://bad.example/recover/' . $keyword . '?token=NO_PROD_CONTENT',
+            $keyword, 'Disposable recovery fixture'), 'Recovery fixture link created.');
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::create($bulk, $owner, 'page',
+            \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason' => 'blocked_domain']),
+            [$keyword]);
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::scanStep($bulk, $job['id'], $owner);
+        $expect($job['phase'] === 'ready' && $job['matched'] === 1,
+            'Recovery fixture dry-run completed without deletion');
+        $job = \ACh\Yourls\UrlGuard\BulkHistory::startDeletion($bulk, $job['id'],
+            $owner, 'DELETE 1', true);
+        $expect($job['phase'] === 'delete' && $job['deleted'] === 0,
+            'Recovery fixture old job explicitly approved but not executed');
+        unset($job['updated_at'], $job['error_class'], $job['error_info']);
+        $bulk->fetchAffected('UPDATE yourls_options SET option_value=:value WHERE option_name=:name', [
+            'value'=>serialize($job), 'name'=>'ach_url_guard_bulk_'.$job['id'],
+        ]);
+        $ids[] = $job['id'];
+    }
+    for ($i=0; $i<37; $i++) {
+        foreach (['integration','other-operator'] as $owner) {
+            \ACh\Yourls\UrlGuard\BulkHistory::create($bulk, $owner, 'all',
+                \ACh\Yourls\UrlGuard\BulkHistory::filter(['reason'=>'blocked_domain']), []);
+        }
+    }
+    echo implode(' ', $ids), "\n";
+    exit(0);
+}
+
+if ($phase === 'background-recovery-discover') {
+    $bulk = yourls_get_db('read-ach_guard_recovery_discover');
+    foreach ([
+        'integration'=>'ACH_IT_RECOVERY_INTEGRATION_ID',
+        'other-operator'=>'ACH_IT_RECOVERY_OTHER_ID',
+        'unavailable-owner'=>'ACH_IT_RECOVERY_MISSING_ID',
+    ] as $owner=>$env) {
+        $id=(string) getenv($env);
+        $expect((bool) preg_match('/^[a-f0-9]{24}$/D', $id), 'Saved fixture ID available');
+        $jobs=\ACh\Yourls\UrlGuard\BulkHistory::recentJobs($bulk,$owner);
+        $expect(in_array($id,array_column($jobs,'id'),true),
+            'Oldest deletion visible in owner-scoped list after >30 newer global rows');
+        foreach ($jobs as $candidate) {
+            $expect($candidate['owner'] === $owner,
+                'Owner-scoped job navigation must not expose cross-owner jobs');
+        }
+        $expect(count($jobs)===($owner==='unavailable-owner' ? 1 : 31),
+            'Each owner sees 30 recent plus every older pending deletion');
+    }
+    echo "PASS disposable multi-owner older-than-30 job discovery and isolation.\n";
+    exit(0);
+}
+
+if ($phase === 'background-recovery-verify') {
+    $bulk=yourls_get_db('read-ach_guard_recovery_verify');
+    foreach ([
+        'integration'=>['ACH_IT_RECOVERY_INTEGRATION_ID','cancelled'],
+        'other-operator'=>['ACH_IT_RECOVERY_OTHER_ID','cancelled'],
+        'unavailable-owner'=>['ACH_IT_RECOVERY_MISSING_ID','delete'],
+    ] as $owner=>[$env,$expectedPhase]) {
+        $id=(string) getenv($env);
+        $job=\ACh\Yourls\UrlGuard\BulkHistory::load($bulk,$id,$owner);
+        $expect($job!==null && $job['phase']===$expectedPhase && $job['deleted']===0,
+            'Only original owners cancel their old jobs, orphan remains blocked');
+        $keyword=match($owner) {
+            'integration'=>'recovery-own',
+            'other-operator'=>'recovery-other',
+            default=>'recovery-missing'
+        };
+        $expect(\ACh\Yourls\UrlGuard\HistoricalReview::find($bulk,$keyword)!==null,
+            'Cancelled and orphan jobs do not delete any URL');
+    }
+    $active=\ACh\Yourls\UrlGuard\BulkHistory::jobInventory($bulk);
+    $deleted=array_values(array_filter($active, static fn(array $job):bool =>
+        $job['phase']==='delete' && $job['owner']==='unavailable-owner'));
+    $expect(count($deleted)===1, 'Unknown owner preapproved deletion remains explicit cron blocker');
+    echo "PASS genuine multi-owner HTTP cancellation, orphan scheduler gate, no URL loss.\n";
     exit(0);
 }
 

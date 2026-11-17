@@ -271,7 +271,13 @@ function ach_url_guard_admin_page(): void
 
     echo '<main role="main" style="max-width:850px;margin:2em auto;">';
     echo '<h2>ACh URL Guard</h2>';
-    echo '<p>Automatic rules apply to new links only; existing redirects remain unchanged unless an admin explicitly reviews and deletes an individual historical link.</p>';
+    echo '<p>Automatic Guard rules apply to newly created links; existing redirects'
+        . ' are not changed automatically. An authenticated administrator may'
+        . ' delete an existing link after individual review, or explicitly approve'
+        . ' a filtered historical batch after a completed dry-run, confirmation'
+        . ' checkbox and exact DELETE N text. Once approved, a server operator'
+        . ' may enable a background worker to process that authorized batch;'
+        . ' the worker does not create or approve deletions.</p>';
     echo '<p><a href="' . ach_url_guard_esc(yourls_admin_url('plugins.php?page=ach_url_guard_history')) . '">Review existing links (manual single-link or explicitly approved background bulk deletion)</a></p>';
     if ($feedback !== '') {
         echo '<p class="' . (strpos($feedback, 'Invalid') === 0 ? 'error' : 'success') . '">' . ach_url_guard_esc($feedback) . '</p>';

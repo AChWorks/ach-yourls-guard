@@ -62,8 +62,15 @@ redirects and customer data.
   operator may separately configure a host-local CLI/cron worker for
   authenticated, explicitly started jobs after a read-only saved-job inventory.
   Existing v0.2.2 delete-phase jobs represent **previously confirmed**
-  destructive work and will resume upon enabling cron; inspect/cancel any
-  unintended delete jobs first without erasing their snapshots or metadata.
+  destructive work and will resume upon enabling cron. The host-local
+  inventory identifies every saved job's owning account and exact ID.
+  Authenticated owners can find all their active deletion jobs even
+  beyond the recent list, or open an exact job ID; cross-owner cancellation
+  remains denied. Inspect/cancel unintended jobs from their original
+  accounts first, without erasing snapshots or metadata. A missing or
+  inaccessible owner with an unresolved delete-phase job blocks scheduler
+  activation until legitimate account recovery or a separately authorized
+  audited recovery procedure resolves the job.
   A legacy scan resumes scanning only, while ready still needs separate
   exact-delete authorization. Scanning must continue
   safely when the admin browser closes and the UI must poll read-only state

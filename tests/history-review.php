@@ -148,6 +148,18 @@ catch (RuntimeException $e) { $anonymousSettingsDenied = true; ob_end_clean(); }
 check($anonymousSettingsDenied, 'neighboring Guard settings page is also restricted');
 $historyAuthenticated = true;
 $_SERVER['REQUEST_METHOD'] = 'GET'; $_POST = [];
+ob_start();
+ach_url_guard_admin_page();
+$settingsView = ob_get_clean();
+check(str_contains($settingsView, 'Automatic Guard rules apply to newly created links')
+    && str_contains($settingsView, 'not changed automatically')
+    && str_contains($settingsView, 'individual review')
+    && str_contains($settingsView, 'filtered historical batch after a completed dry-run')
+    && str_contains($settingsView, 'exact DELETE N')
+    && str_contains($settingsView, 'background worker')
+    && !str_contains($settingsView, 'unless an admin explicitly reviews and deletes an individual historical link'),
+    'Guard settings explain new-link enforcement, individual and background bulk deletion accurately');
+
 
 check(HistoricalReview::inspect($db->rows['bad'], $settings)['reason'] === 'blocked_domain', 'blocked domain flagged');
 check(HistoricalReview::inspect($db->rows['home'], $settings)['reason'] === 'root_url', 'homepage-only flagged');
@@ -245,6 +257,12 @@ check(str_contains($html, 'Select All Matching Filters across every page'),
 check(str_contains($html, 'name="bulk_keywords[]"'), 'table row checkbox attached to filter form');
 check(str_contains($html, 'name="bulk_filter[reason]"'), 'reason filter visible');
 check(str_contains($html, 'name="bulk_filter[clicks]"'), 'clicks filter visible');
+check(str_contains($html, 'Open your job by exact ID')
+    && str_contains($html, 'name="bulk_job"')
+    && str_contains($html, 'pattern="[0-9a-f]{24}"')
+    && str_contains($html, 'Jobs are private to the YOURLS account'),
+    'Owner-scoped exact ID recovery exists even when the recent list is empty');
+
 
 check(str_contains($html, 'Check HTTP'), 'clean old rows can receive a manual HTTP check');
 check(!str_contains($html, 'NEVER_SHOW') && !str_contains($html, 'DO_NOT_EXPOSE')

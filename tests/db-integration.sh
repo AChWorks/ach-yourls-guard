@@ -28,6 +28,8 @@ ACH_IT_COOKIE_KEY="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
 export ACH_IT_COOKIE_KEY
 ACH_IT_ADMIN_PASS="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 export ACH_IT_ADMIN_PASS
+ACH_IT_OTHER_PASS="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+export ACH_IT_OTHER_PASS
 # shellcheck disable=SC2016 # PHP variables must remain literal inside single quotes.
 ACH_IT_HTTP_PORT="$(php -r '$s = stream_socket_server("tcp://127.0.0.1:0"); if (!$s) exit(1); echo (int) substr(strrchr(stream_socket_get_name($s, false), ":"), 1); fclose($s);')"
 export ACH_IT_HTTP_PORT
@@ -126,7 +128,8 @@ define('YOURLS_URL_CONVERT', 36);
 // Fixture normally disables flood for rapid link insertions; final native-flood probes opt back in.
 define('YOURLS_FLOOD_DELAY_SECONDS', (int) (getenv('ACH_IT_FLOOD_DELAY') ?: '0'));
 define('YOURLS_DEBUG', false);
-$yourls_user_passwords = ['integration' => getenv('ACH_IT_ADMIN_PASS')];
+$yourls_user_passwords = ['integration' => getenv('ACH_IT_ADMIN_PASS'),
+    'other-operator' => getenv('ACH_IT_OTHER_PASS')];
 CONFIG
 
 run_php "$repo/tests/db-phase.php" create
@@ -216,6 +219,26 @@ export ACH_IT_HTTP_PUBLIC_ID="$(ACH_IT_HTTP_LABEL=public run_php "$repo/tests/db
 export ACH_IT_HTTP_OTHER_ID="$(ACH_IT_HTTP_LABEL=other run_php "$repo/tests/db-phase.php" background-http-seed)"
 export ACH_IT_HTTP_STALE_PRIVATE_ID="$(ACH_IT_HTTP_LABEL=stale-private run_php "$repo/tests/db-phase.php" background-http-seed)"
 export ACH_IT_HTTP_STALE_PUBLIC_ID="$(ACH_IT_HTTP_LABEL=stale-public run_php "$repo/tests/db-phase.php" background-http-seed)"
+# Real older approved delete jobs, followed by >30 newer jobs per owner.
+read -r ACH_IT_RECOVERY_INTEGRATION_ID ACH_IT_RECOVERY_OTHER_ID ACH_IT_RECOVERY_MISSING_ID \
+  < <(run_php "$repo/tests/db-phase.php" background-recovery-seed)
+export ACH_IT_RECOVERY_INTEGRATION_ID ACH_IT_RECOVERY_OTHER_ID ACH_IT_RECOVERY_MISSING_ID
+inspection="$(run_php "$ACH_IT_SITE/user/plugins/ach-url-guard/bin/bulk-worker.php" --site="$ACH_IT_SITE" --inspect 2>"$tmp/recovery-inspect-stderr")"
+for row in \
+  "$ACH_IT_RECOVERY_INTEGRATION_ID:integration" \
+  "$ACH_IT_RECOVERY_OTHER_ID:other-operator" \
+  "$ACH_IT_RECOVERY_MISSING_ID:unavailable-owner"; do
+  id="$(printf '%s' "$row" | cut -d: -f1)"
+  owner="$(printf '%s' "$row" | cut -d: -f2)"
+  grep -Fq "job=$id owner=\"$owner\" phase=delete" <<< "$inspection" || {
+    echo 'Missing job/owner in host-local inventory' >&2; exit 1;
+  }
+done
+grep -Fq 'WARNING: ' "$tmp/recovery-inspect-stderr" || {
+  echo 'Missing operator warning for preapproved destructive jobs' >&2; exit 1;
+}
+run_php "$repo/tests/db-phase.php" background-recovery-discover
+
 export ACH_IT_LOGIN_NONCE="$(run_php "$repo/tests/db-phase.php" login-nonce)"
 
 # The opt-in historical audit is required to be read-only, including options/events.
@@ -290,6 +313,9 @@ if ! run_php "$repo/tests/http-integration.php" verify-public; then
 fi
 
 run_php "$repo/tests/db-phase.php" background-http-check
+run_php "$repo/tests/db-phase.php" background-recovery-verify
+# The orphaned pre-approved fixture is deliberately not processed. Its
+# presence demonstrates the documented "do not enable cron" operator gate.
 # Prove admission works across distinct PHP processes with the real YOURLS
 # native flood policy enabled. Never call external HTTP/provider services.
 gate_before="$(run_php "$repo/tests/db-phase.php" snapshot)"

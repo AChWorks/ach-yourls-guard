@@ -178,36 +178,30 @@ final class BulkHistory
         if ((int) $n !== 1) throw new \RuntimeException('Could not save review progress');
     }
 
-    /** Recovery links for the authenticated owner's recent saved jobs. */
+    /**
+     * Recover the newest saved jobs belonging to one authenticated owner,
+     * PLUS every still-running delete-phase job of that owner, regardless of
+     * age. A global SQL LIMIT would hide older destructive jobs when other
+     * administrators have created newer records.
+     *
+     * The normalized inventory is used here, so the list never crosses owner
+     * boundaries. This method is read-only and does not change job phases.
+     */
     public static function recentJobs($db, string $owner): array
     {
-        $rows = $db->fetchAll('SELECT option_name, option_value FROM ' . self::optionsTable()
-            . ' WHERE option_name LIKE :prefix ORDER BY option_id DESC LIMIT 30',
-            ['prefix' => self::OPTION_PREFIX . '%']);
-        $jobs = [];
-        foreach ($rows as $row) {
-            $name = (string) ($row['option_name'] ?? '');
-            if (!str_starts_with($name, self::OPTION_PREFIX)) continue;
-            $id = substr($name, strlen(self::OPTION_PREFIX));
-            if (!preg_match('/^[0-9a-f]{24}$/D', $id)) continue;
-            $job = yourls_maybe_unserialize((string) ($row['option_value'] ?? ''));
-            if (!is_array($job) || ($job['owner'] ?? '') !== $owner || ($job['id'] ?? '') !== $id) {
-                continue;
+        $jobs = array_values(array_filter(self::jobInventory($db),
+            static fn(array $job): bool => $job['owner'] === $owner));
+        $jobs = array_reverse($jobs); // newest first, like the prior Recent UI
+        $recent = array_slice($jobs, 0, 30);
+        $included = array_fill_keys(array_column($recent, 'id'), true);
+        foreach ($jobs as $job) {
+            if ($job['phase'] === 'delete' && !isset($included[$job['id']])) {
+                $recent[] = $job;
             }
-            $jobs[] = [
-                'id' => $id, 'phase' => (string) ($job['phase'] ?? 'unknown'),
-                'matched' => (int) ($job['matched'] ?? 0),
-                'deleted' => (int) ($job['deleted'] ?? 0),
-            ];
         }
-        return $jobs;
+        return $recent;
     }
 
-    /**
-     * Enumerate previously approved active jobs for an authenticated host-local
-     * worker. Only the admin request handler can create a scan or authorize
-     * the phase transition to deletion; this listing never performs either.
-     */
     /** Inspect the whole saved job inventory before enabling a scheduler.
      * In particular, a legacy v0.2.2 delete-phase job was already approved
      * and would resume once a worker is first enabled.

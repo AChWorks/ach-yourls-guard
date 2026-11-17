@@ -174,6 +174,107 @@ $exerciseBulkHttp = static function (string $mode) use ($request, $expect): void
     echo 'PASS genuine ' . $mode . '-mode YOURLS cookie/nonce/AJAX/DELETE N authorization and privacy.' . "\n";
 };
 
+/**
+ * N1: prove owner-only cancellation for jobs older than 30 global records.
+ * Both accounts authenticate via native YOURLS login/cookies. No worker is
+ * executed here; the unavailable owner's approved job remains a scheduler gate.
+ */
+$exerciseRecoveryHttp = static function () use ($request, $expect): void {
+    $owned = (string) getenv('ACH_IT_RECOVERY_INTEGRATION_ID');
+    $other = (string) getenv('ACH_IT_RECOVERY_OTHER_ID');
+    $missing = (string) getenv('ACH_IT_RECOVERY_MISSING_ID');
+    foreach ([$owned,$other,$missing] as $id) {
+        $expect((bool) preg_match('/^[a-f0-9]{24}$/D', $id),
+            'All original-owner recovery job identities are available');
+    }
+    $currentCookie = (string) file_get_contents((string) getenv('ACH_IT_TEST_COOKIE_FILE'));
+    $expect($currentCookie !== '', 'Native primary administrator cookie exists');
+
+    // Obtain a second genuine YOURLS session. The inventory includes this
+    // account explicitly, but the first account must not cancel its work.
+    [$loginStatus,$loginHeaders] = $request(
+        '/admin/plugins.php?page=ach_url_guard_history',
+        ['username'=>'other-operator','password'=>(string)getenv('ACH_IT_OTHER_PASS'),
+            'nonce'=>(string)getenv('ACH_IT_LOGIN_NONCE'),'submit'=>'Login']);
+    $cookies=[];
+    foreach ($loginHeaders as $header) {
+        if (preg_match('/^Set-Cookie:\s*([^;,\r\n]+)/i', $header, $match))
+            $cookies[]=$match[1];
+    }
+    $expect(in_array($loginStatus,[301,302,303],true) && $cookies!==[],
+        'Other admin must log in through the real YOURLS login form');
+    $otherCookie=implode('; ', $cookies);
+
+    $base='/admin/plugins.php?page=ach_url_guard_history&bulk_job=';
+    $getOwnedForm=static function (string $id, string $cookie) use ($request,$expect,$base): array {
+        [$code,,$html]=$request($base.$id,null,$cookie);
+        $expect($code===200 && str_contains($html,'Legacy delete-phase job:')
+            && str_contains($html,'Cancel job (completed deletions remain)'),
+            'Old authorized deletion is visible on exact owner-scoped job page');
+        $expect(preg_match('/name="bulk_nonce" value="([^"]+)"/',$html,$found)===1,
+            'Original owner can retrieve native cancellation nonce');
+        return [$found[1],$html];
+    };
+    [$nonceOwn,$ownPage]=$getOwnedForm($owned,$currentCookie);
+    [$nonceOther,$otherPage]=$getOwnedForm($other,$otherCookie);
+    $expect(str_contains($ownPage,'Previously approved deletion jobs')
+        && str_contains($ownPage,$owned)
+        && !str_contains($ownPage,$other),
+        'First admin sees old owned delete job but no other-owner job');
+    $expect(str_contains($otherPage,'Previously approved deletion jobs')
+        && str_contains($otherPage,$other)
+        && !str_contains($otherPage,$owned),
+        'Second admin sees old owned delete job but no first-owner job');
+
+    [$denied,,$foreignHtml]=$request($base.$other,null,$currentCookie);
+    $expect($denied===200 && str_contains($foreignHtml,'No accessible job with this ID.')
+        && !str_contains($foreignHtml,'Legacy delete-phase job:'),
+        'Cross-owner GET of an exact job ID is denied');
+    [$orphanDenied,,$orphanHtml]=$request($base.$missing,null,$currentCookie);
+    $expect($orphanDenied===200 && str_contains($orphanHtml,'No accessible job with this ID.')
+        && !str_contains($orphanHtml,'Legacy delete-phase job:'),
+        'Unavailable-owner job cannot be opened by any available admin');
+
+    $cancel=static fn(string $id,string $nonce): array => [
+        'bulk_action'=>'cancel','bulk_job'=>$id,'bulk_nonce'=>$nonce
+    ];
+    [$wrongCancel,,$wrongBody]=$request(
+        '/admin/plugins.php?page=ach_url_guard_history',
+        $cancel($other,$nonceOwn), $currentCookie);
+    $expect($wrongCancel===200
+        && str_contains($wrongBody,'Could not complete the requested operation')
+        && !str_contains($wrongBody,'Cancelled. No further deletion'),
+        'Authenticated user cannot cancel another owner job with a valid own nonce');
+    [$verifyOther,,$otherAfterUnauthorized]=$request($base.$other,null,$otherCookie);
+    $expect($verifyOther===200 && str_contains($otherAfterUnauthorized,'Legacy delete-phase job:')
+        && str_contains($otherAfterUnauthorized,'Deleting — explicitly confirmed batch')
+        && !str_contains($otherAfterUnauthorized,'Cancelled. No further deletion'),
+        'Cross-owner cancellation POST leaves the original owner job actively unchanged');
+    // Missing-owner job cannot be cancelled through either real account.
+    [$orphanCancel,,$orphanBody]=$request(
+        '/admin/plugins.php?page=ach_url_guard_history',
+        $cancel($missing,$nonceOther), $otherCookie);
+    $expect($orphanCancel===200
+        && str_contains($orphanBody,'Could not complete the requested operation'),
+        'Other admin cannot act on unavailable owner job');
+
+    foreach ([[$owned,$nonceOwn,$currentCookie],[$other,$nonceOther,$otherCookie]] as $item) {
+        [$id,$nonce,$cookie]=$item;
+        [$cancelCode,,$cancelHtml]=$request(
+            '/admin/plugins.php?page=ach_url_guard_history',
+            $cancel($id,$nonce),$cookie);
+        $expect($cancelCode===200
+            && str_contains($cancelHtml,'Cancelled. No further deletion')
+            && !str_contains($cancelHtml,'Deleting — explicitly confirmed batch'),
+            'Original owner cancels previous delete job with valid YOURLS session+nonce');
+        [$checkCode,,$checkBody]=$request($base.$id,null,$cookie);
+        $expect($checkCode===200 && str_contains($checkBody,'Cancelled. No further deletion'),
+            'Cancelled report persists and remains navigable to its original owner');
+    }
+    echo "PASS genuine multi-admin HTTP job recovery after 30 global records,"
+        . " owner-only cancellation, orphan gate and no deletion.\n";
+};
+
 if ($phase === 'verify-public') {
     foreach (['/admin/plugins.php?page=ach_url_guard',
               '/admin/plugins.php?page=ach_url_guard_history'] as $url) {
@@ -311,4 +412,5 @@ $expect(!str_contains($body, 'Reviewed short link was deleted')
 
 
 $exerciseBulkHttp('private');
+$exerciseRecoveryHttp();
 echo 'PASS loopback HTTP: authenticated API allow/deny, old/new real redirects, protected admin settings.' . "\n";
