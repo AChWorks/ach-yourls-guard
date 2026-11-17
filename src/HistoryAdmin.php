@@ -164,6 +164,7 @@ function ach_url_guard_history_page(): void
     if ($bulkError !== '') ach_url_guard_history_message($bulkError);
     if ($bulkJob !== null) ach_url_guard_bulk_job($bulkJob);
     ach_url_guard_bulk_filter_form();
+    ach_url_guard_bulk_recent_jobs($db);
 
     echo '<form method="get"><input type="hidden" name="page" value="ach_url_guard_history" />';
     echo '<p><label>Find exact short keyword: <input type="text" name="keyword" value="'

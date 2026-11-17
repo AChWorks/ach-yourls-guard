@@ -59,8 +59,9 @@ if ($phase === 'verify-public') {
         ]);
         $expect($status === 403, 'Public-mode anonymous admin POST must return 403: ' . $url);
     }
-    [$status,,$body] = $request('/');
-    $expect($status === 200, 'Public homepage still available when admin is protected.');
+    // The disposable router routes / to yourls-loader.php; request the native index directly.
+    [$status,,$body] = $request('/index.php');
+    $expect($status === 200, 'Public shortening homepage still available when admin is protected.');
     echo 'PASS public-mode unauthenticated settings/review GET and POST denied; homepage works.' . "\n";
     exit(0);
 }

@@ -20,6 +20,7 @@ final class FakeHistoryDB
 
     public function fetchAll(string $query, array $binds): array
     {
+        if (array_key_exists('prefix', $binds)) return [];
         if (array_key_exists('name', $binds) && $binds['name'] === 'ach_url_guard_settings') {
             return $this->settingsRaw === null ? [] : [['option_value' => serialize($this->settingsRaw)]];
         }

@@ -167,6 +167,31 @@ final class BulkHistory
         if ((int) $n !== 1) throw new \RuntimeException('Could not save review progress');
     }
 
+    /** Recovery links for the authenticated owner's recent saved jobs. */
+    public static function recentJobs($db, string $owner): array
+    {
+        $rows = $db->fetchAll('SELECT option_name, option_value FROM ' . self::optionsTable()
+            . ' WHERE option_name LIKE :prefix ORDER BY option_id DESC LIMIT 30',
+            ['prefix' => self::OPTION_PREFIX . '%']);
+        $jobs = [];
+        foreach ($rows as $row) {
+            $name = (string) ($row['option_name'] ?? '');
+            if (!str_starts_with($name, self::OPTION_PREFIX)) continue;
+            $id = substr($name, strlen(self::OPTION_PREFIX));
+            if (!preg_match('/^[0-9a-f]{24}$/D', $id)) continue;
+            $job = yourls_maybe_unserialize((string) ($row['option_value'] ?? ''));
+            if (!is_array($job) || ($job['owner'] ?? '') !== $owner || ($job['id'] ?? '') !== $id) {
+                continue;
+            }
+            $jobs[] = [
+                'id' => $id, 'phase' => (string) ($job['phase'] ?? 'unknown'),
+                'matched' => (int) ($job['matched'] ?? 0),
+                'deleted' => (int) ($job['deleted'] ?? 0),
+            ];
+        }
+        return $jobs;
+    }
+
     /** Bounded keyset scan; never serializes an unbounded keyword list. */
     private static function sourcePage($db, array $job): array
     {

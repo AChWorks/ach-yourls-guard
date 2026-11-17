@@ -148,6 +148,26 @@ function ach_url_guard_bulk_job(array $job): void
     echo '</section>';
 }
 
+function ach_url_guard_bulk_recent_jobs($db): void
+{
+    try {
+        $jobs = BulkHistory::recentJobs($db, BulkHistory::actor());
+        if ($jobs === []) return;
+        echo '<section aria-label="Resume prior bulk review jobs"><h3>Recent saved jobs</h3><ul>';
+        foreach ($jobs as $job) {
+            $url = yourls_admin_url('plugins.php?page=ach_url_guard_history&bulk_job='
+                . rawurlencode($job['id']));
+            echo '<li><a href="' . ach_url_guard_esc($url) . '">'
+                . ach_url_guard_esc($job['phase']) . ' — '
+                . (int) $job['matched'] . ' matched, ' . (int) $job['deleted']
+                . ' deleted</a></li>';
+        }
+        echo '</ul></section>';
+    } catch (Throwable $error) {
+        error_log('ACh URL Guard recent job list failed [' . get_class($error) . ']');
+    }
+}
+
 /** Form fields are associated with table-row checkboxes using form= attribute. */
 function ach_url_guard_bulk_filter_form(): void
 {

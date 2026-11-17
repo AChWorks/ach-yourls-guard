@@ -21,7 +21,7 @@ final class BulkSqlite
     public function __construct()
     {
         $this->pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
-        $this->pdo->exec('CREATE TABLE yourls_options (option_name TEXT PRIMARY KEY, option_value TEXT NOT NULL)');
+        $this->pdo->exec('CREATE TABLE yourls_options (option_id INTEGER PRIMARY KEY AUTOINCREMENT, option_name TEXT UNIQUE, option_value TEXT NOT NULL)');
         $this->pdo->exec('CREATE TABLE yourls_url (keyword TEXT PRIMARY KEY, url TEXT, title TEXT, timestamp TEXT, clicks INTEGER)');
         $this->pdo->exec('CREATE TABLE yourls_ach_guard_candidates (job_id TEXT NOT NULL, keyword TEXT NOT NULL, row_proof TEXT, reason TEXT, result TEXT DEFAULT \'pending\', PRIMARY KEY(job_id, keyword))');
     }
@@ -97,6 +97,9 @@ $job=BulkHistory::create($db,'fixture-admin','all',$filters,[]);
 $id=$job['id'];
 assertBulk(strlen($id)===24 && $job['phase']==='scan','all-matching job created');
 assertBulk(BulkHistory::load($db,$id,'someone-else')===null,'job owner separation');
+$ownerJobs=BulkHistory::recentJobs($db,'fixture-admin');
+assertBulk(count($ownerJobs)===1 && $ownerJobs[0]['id']===$id,'owner can recover jobs');
+assertBulk(BulkHistory::recentJobs($db,'someone-else')===[],'other user cannot enumerate jobs');
 $passes=0;
 while($job['phase']==='scan'){
     $job=BulkHistory::scanStep($db,$id,'fixture-admin');
