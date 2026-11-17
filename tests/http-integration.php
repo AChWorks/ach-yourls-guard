@@ -104,10 +104,20 @@ $expect(is_array($exactMin) && ($exactMin['status'] ?? '') === 'success'
     'Authenticated native HTTP API accepts a custom keyword exactly at minimum length.');
 
 [$httpCode, , $body] = $request('/yourls-api.php', $credentials + [
+    'url' => 'https://example.com/HTTP/UppercaseMinimum', 'keyword' => 'QWERT',
+]);
+$upperMinimum = json_decode($body, true);
+$expect(is_array($upperMinimum) && ($upperMinimum['status'] ?? '') === 'success'
+    && ($upperMinimum['url']['keyword'] ?? '') === 'qwert' && $httpCode === 200,
+    'Force Lowercase normalizes an all-uppercase five-character alias even before core keyword hooks.');
+
+[$httpCode, , $body] = $request('/yourls-api.php', $credentials + [
     'url' => 'https://example.com/HTTP/CaseSensitive?abc=XYZ', 'keyword' => 'HTTP-UPPER',
 ]);
 $allowed = json_decode($body, true);
-$expect(is_array($allowed) && ($allowed['status'] ?? '') === 'success', 'Authenticated HTTP API must create allowed destination, got HTTP ' . $httpCode);
+$expect(is_array($allowed) && ($allowed['status'] ?? '') === 'success',
+    'Authenticated HTTP API must create allowed destination, got HTTP ' . $httpCode
+    . ', API code ' . (string) ($allowed['code'] ?? 'missing'));
 $expect(($allowed['url']['keyword'] ?? '') === 'http-upper', 'Force Lowercase must affect keyword but not target path.');
 $expect($httpCode === 200, 'Allowed API request must return HTTP 200.');
 

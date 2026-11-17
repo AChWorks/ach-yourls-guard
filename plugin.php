@@ -41,6 +41,13 @@ function ach_url_guard_on_create($original, $url, $keyword = '', $title = '')
         // aliases separately. Use the core sanitizer to count what would be saved.
         $normalizedKeyword = is_scalar($keyword) ? (string) $keyword : '';
         if ($normalizedKeyword !== '') {
+            // Force Lowercase installs its custom-keyword sanitizer only AFTER
+            // shunt_add_new_link runs. Match its already-loaded ASCII case
+            // normalization before measuring length; do not change the actual
+            // keyword handed to YOURLS or invoke its native action prematurely.
+            if (function_exists('ozh_break_the_web_lowercase')) {
+                $normalizedKeyword = ozh_break_the_web_lowercase($normalizedKeyword);
+            }
             $normalizedKeyword = yourls_sanitize_keyword($normalizedKeyword, true);
         }
         $keywordPolicy = Policy::inspectKeyword($normalizedKeyword, $settings);
