@@ -37,8 +37,10 @@ redirects and customer data.
   Defer other costly work during the native delay without imposing an
   unrelated rate limit; honor native private-admin/IP exemptions. Deferred
   decisions follow the established operator unknown policy. Store only
-  hashed fingerprints and small verdicts in bounded private temporary
-  state, never full URLs/keys or extra schema/cron state.
+  hashed fingerprints, unique per-admission generation IDs and small verdicts
+  in bounded private temporary state, never full URLs/keys or extra
+  schema/cron state. Completions must verify that the exact generation owns
+  the active entry, preventing stale results from overwriting newer work.
 - Preserve native YOURLS anti-flood and interoperability with Random ShortURLs,
   Allow Hyphens and Force Lowercase, existing aliases and case-sensitive URL paths.
 - Offer bounded manual read-only auditing of older links, no automatic
@@ -71,7 +73,10 @@ redirects and customer data.
   GET-only redirect behavior, native API HTTP status, and intact existing
   links. Rapid fixture creation disables native flood only for that phase;
   separate tests enable real native flood delay and verify cross-process
-  work admission. PR CI must assert literal candidate SHA and GitHub tree,
+  work admission. Deterministic overlapping tests cover stale allow versus
+  newer deny, stale deny versus newer allow, different fingerprints, normal
+  caching, expiry and original caller results. PR CI must assert literal
+  candidate SHA and GitHub tree,
   never substitute the synthetic merge commit for exact-HEAD evidence.
 - Require an independent review before integrating or deploying security code.
 - Production environments permit only explicitly authorized operations;

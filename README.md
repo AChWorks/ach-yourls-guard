@@ -48,11 +48,11 @@ Lines beginning with `#` are ignored as comments. All rules are local, editable,
 
 ## Expensive-validation work admission
 
-The new-link shunt runs before YOURLS's native flood check. Before optional expensive Regex, DNS, HTTP or Web Risk evaluation, ACh URL Guard now calls the native YOURLS flood check and uses its **configured flood delay** for cost admission (rather than introducing a new unrelated rate limit). It coalesces repeated identical rejected checks and defers different costly checks from the same non-exempt client within that interval. Cheap local domain, phrase, root and URL-structure denials remain immediately enforceable.
+The new-link shunt runs before YOURLS's native flood check. Before optional expensive Regex, DNS, HTTP or Web Risk evaluation, ACh URL Guard now calls the native YOURLS flood check and uses its **configured flood delay** for cost admission (rather than introducing a new unrelated rate limit). It coalesces repeated identical rejected checks and defers different costly checks from the same non-exempt client within that interval. Each admitted verification has an independent random generation ID; the result is cached only if that exact admission still owns the state, so a slow previous attempt cannot overwrite a newer in-flight or completed attempt. Cheap local domain, phrase, root and URL-structure denials remain immediately enforceable.
 
 Deferred checks are explicitly recorded as `work_deferred`, not treated as clean passes. Their acceptance/rejection follows the existing `unknown_action` setting: the default is unverified/allowed; the operator-selected strict mode temporarily rejects with HTTP 503. Authenticated private admins and native whitelisted IPs remain exempt; native delay 0 deliberately disables this admission budget.
 
-Temporary admission state is private, bounded (256 buckets x 32 anonymous client identities), under PHP's writable temporary directory, outside the YOURLS document root. Only keyed IP fingerprints, request fingerprints and small verdicts are stored, never raw IPs, URLs, query tokens or API keys. No new table, cron or external provider. If safe shared temporary storage is unavailable, `work_control_unavailable` is visible under the same unknown policy rather than silently executing unlimited costly operations. Check temporary-directory writability before opting in to costly validation.
+Temporary admission state is private, bounded (256 buckets x 32 anonymous client identities), under PHP's writable temporary directory, outside the YOURLS document root. Only keyed IP fingerprints, request fingerprints, per-admission generation IDs and small verdicts are stored, never raw IPs, URLs, query tokens or API keys. No new table, cron or external provider. If safe shared temporary storage is unavailable, `work_control_unavailable` is visible under the same unknown policy rather than silently executing unlimited costly operations. Check temporary-directory writability before opting in to costly validation.
 
 ## Google Web Risk
 
@@ -100,6 +100,7 @@ php -l plugin.php
 find src bin tests -name '*.php' -type f -exec php -l {} \;
 php tests/run.php
 php tests/curl-safety-contract.php
+php tests/workgate-concurrency.php
 YOURLS_SOURCE=/path/to/YOURLS-1.10.6 php tests/yourls-hook-contract.php
 YOURLS_SOURCE=/path/to/YOURLS-1.10.6 FORCE_LOWERCASE_SOURCE=/path/to/force-lowercase bash tests/db-integration.sh
 ```
@@ -107,6 +108,8 @@ YOURLS_SOURCE=/path/to/YOURLS-1.10.6 FORCE_LOWERCASE_SOURCE=/path/to/force-lower
 Coverage includes the default anti-chaining domain rules, custom alias cap in Monitor/Enforce and 0-disable behavior, local URL terms/Regex and reserved aliases, invalid admin-rule rejection and real HTTP API status checks, as well as root-only URLs, exact/wildcard rules, private/reserved addresses, numeric aliases, dangerous redirect targets, GET-only redirect validation, HTTP error handling, Google Web Risk and DNSBL mocks, unknown handling, and the YOURLS shunt/monitor/enforce contract. Network calls are mocked in the test harness, so no outside URLs are fetched. The cURL transport tests explicitly verify that failed option configuration never executes a network request and that DNS pinning, TLS and proxy restrictions are selected. The hook contract uses the actual upstream YOURLS filter implementation, without an active database. The separate database/HTTP integration test installs actual YOURLS 1.10.6 into a disposable MariaDB instance and isolated site, loads Random ShortURLs, Allow Hyphens, Force Lowercase and ACh URL Guard, verifies monitoring/enforcement, authenticated HTTP API allow/deny and HTTP status, existing/new redirect targets, protected admin settings, and compares a full database snapshot before/after the read-only historical audit. It never fetches an external test URL or points at Production.
 
 The integration additionally proves repeated rejected checks are coalesced and other expensive requests are deferred across separate PHP processes with the **actual native YOURLS 15-second flood delay**; it verifies no YOURLS database mutations from this admission state.
+
+A deterministic Fiber-based regression test suspends two overlapping verifications past the native delay, checks both allow/deny orders and different request fingerprints, and asserts that older completion cannot replace a newer working or completed verdict. It also verifies normal caching, expiry, original caller results and cleanup, without real network requests or timing sleeps.
 
 The integration script requires `mariadb-install-db`, `mariadbd`, PHP with `pdo_mysql` and `mysqli`, plus the two source checkouts. It uses an auto-generated local socket-only database and a private temporary directory (`TMPDIR` can select a filesystem with sufficient space), and tears down its resources on completion. GitHub Actions uses a loopback-only MariaDB service in the same test. The disposable fixture sets YOURLS's documented flood delay to zero to permit repeated rapid test creations; this does not change the site's anti-flood policy or the plugin code.
 

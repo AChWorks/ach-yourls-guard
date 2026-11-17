@@ -67,6 +67,8 @@ jobs:
         run: php tests/curl-safety-contract.php
       - name: YOURLS 1.10.6 hook contract
         run: YOURLS_SOURCE="$PWD/upstream-yourls" php tests/yourls-hook-contract.php
+      - name: Deterministic overlapping WorkGate ownership
+        run: php tests/workgate-concurrency.php
       - name: Isolated YOURLS 1.10.6 and MariaDB integration
         env:
           ACH_IT_EXTERNAL_DB: '1'

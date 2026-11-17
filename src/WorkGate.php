@@ -71,8 +71,12 @@ final class WorkGate
             substr(hash('sha256', (string) YOURLS_ABSPATH), 0, 24));
         $ipHash = hash_hmac('sha256', $clientIp, defined('YOURLS_COOKIEKEY') ? (string) YOURLS_COOKIEKEY : (string) YOURLS_ABSPATH);
         $fingerprint = hash('sha256', $url . "\0" . serialize($settings) . "\0" . hash('sha256', $secret));
+        // A fingerprint identifies the request, not the execution. The same
+        // request can be admitted again after expiry while an earlier attempt
+        // is still running; completion must belong to the exact admission.
+        $generation = bin2hex(random_bytes(16));
         $take = self::transaction($directory, $ipHash, $now, $delay,
-            static function (array &$items) use ($ipHash, $fingerprint, $now, $delay): array {
+            static function (array &$items) use ($ipHash, $fingerprint, $generation, $now, $delay): array {
                 $prior = $items[$ipHash] ?? null;
                 if (is_array($prior) && $now - (float) ($prior['at'] ?? 0) < $delay) {
                     if (($prior['fingerprint'] ?? '') === $fingerprint &&
@@ -85,6 +89,7 @@ final class WorkGate
                 $items[$ipHash] = [
                     'at' => $now,
                     'fingerprint' => $fingerprint,
+                    'generation' => $generation,
                     'state' => 'working',
                 ];
                 return ['kind' => 'admitted', 'changed' => true];
@@ -112,11 +117,14 @@ final class WorkGate
             'reason' => (string) ($result['reason'] ?? 'unknown'),
             'host' => (string) ($result['host'] ?? ''),
         ];
-        // A concurrent request may have replaced an expired marker. Never
-        // overwrite newer state with an earlier completion.
+        // A concurrent request may have replaced an expired marker with a
+        // new admission of the *same* URL and fingerprint. The random
+        // generation identifies this exact attempt and prevents an old
+        // completion from publishing over any newer working/completed result.
         self::transaction($directory, $ipHash, $now, $delay,
-            static function (array &$items) use ($ipHash, $fingerprint, $compact): array {
+            static function (array &$items) use ($ipHash, $fingerprint, $generation, $compact): array {
                 if (($items[$ipHash]['fingerprint'] ?? '') !== $fingerprint ||
+                    ($items[$ipHash]['generation'] ?? null) !== $generation ||
                     ($items[$ipHash]['state'] ?? '') !== 'working') {
                     return ['kind' => 'stale'];
                 }
